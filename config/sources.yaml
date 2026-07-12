@@ -1,0 +1,63 @@
+# 数据源配置
+data_sources:
+  market_data:
+    primary: akshare
+    fallback: [tickflow, yfinance]
+    timeout_seconds: 30
+    retry_count: 3
+
+  news:
+    primary: serpapi
+    fallback: [tavily, bocha]
+    timeout_seconds: 20
+    retry_count: 2
+
+  polymarket:
+    primary: polymarket_api
+    fallback: []
+    timeout_seconds: 15
+    retry_count: 1
+    optional: true
+
+  stock_analysis:
+    primary: dsa_cli
+    fallback: [alphasift]
+    timeout_seconds: 60
+    retry_count: 2
+
+# 最小运行条件
+min_requirements:
+  morning:
+    must_pass:
+      - trading_calendar
+      - market_data
+      - llm_or_template
+    at_least_one:
+      - news_serpapi
+      - news_tavily
+      - news_bocha
+    optional:
+      - polymarket
+      - alphasift
+      - dsa
+      - feishu
+
+  closing:
+    must_pass:
+      - trading_calendar
+      - market_data
+      - llm_or_template
+    at_least_one:
+      - news_serpapi
+      - news_tavily
+      - news_bocha
+    optional:
+      - polymarket
+      - feishu
+
+# 缓存时效
+cache_policy:
+  market_data: 0  # 不允许过期缓存
+  news: 24h
+  polymarket: 1h
+  config: long

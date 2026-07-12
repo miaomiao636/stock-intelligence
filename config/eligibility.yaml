@@ -1,0 +1,22 @@
+# 交易资格过滤规则
+hard_filters:
+  exclude_st: true
+  exclude_suspended: true
+  exclude_new_stock_days: 5
+  exclude_one_word_limit_up: true
+  exclude_one_word_limit_down: true
+  exclude_current_limit_up: false
+  exclude_current_limit_down: true
+
+  # 流动性过滤
+  min_daily_amount: 50000000
+  min_market_cap: 3000000000
+
+board_permissions:
+  allowed:
+    - main_board
+    - etf
+  restricted:
+    - gem_board
+    - star_board
+    - bse_board

@@ -1,0 +1,40 @@
+# 交易成本模型
+cost_components:
+  commission:
+    name: 佣金
+    rate_bps: 1.5
+    min_amount: 5
+    direction: both
+
+  stamp_tax:
+    name: 印花税
+    rate_bps: 5
+    direction: sell_only
+
+  transfer_fee:
+    name: 过户费
+    rate_bps: 0.5
+    direction: both
+
+  slippage:
+    name: 滑点
+    base_bps: 5
+    dynamic_rules:
+      - min_amount: 1000000000
+        additional_bps: 0
+      - min_amount: 500000000
+        additional_bps: 3
+      - min_amount: 100000000
+        additional_bps: 8
+      - min_amount: 50000000
+        additional_bps: 15
+
+instrument_rules:
+  stock:
+    stamp_tax_sell_bps: 5
+  etf:
+    stamp_tax_sell_bps: 0
+
+total_cost:
+  round_trip_bps: 30
+  round_trip_bps_etf: 25

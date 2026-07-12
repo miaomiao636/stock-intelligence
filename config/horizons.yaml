@@ -1,0 +1,25 @@
+# 推荐周期定义
+horizons:
+  short:
+    name: 短期
+    min_days: 1
+    max_days: 5
+    check_frequency: daily
+    alert_before_days: 1
+    typical_use: 事件驱动、技术突破、短线交易
+
+  medium:
+    name: 中期
+    min_days: 10
+    max_days: 28
+    check_frequency: weekly
+    alert_before_days: 3
+    typical_use: 板块轮动、政策催化、趋势跟踪
+
+  long:
+    name: 长期
+    min_days: 30
+    max_days: 90
+    check_frequency: monthly
+    alert_before_days: 7
+    typical_use: 基本面改善、行业拐点、价值投资

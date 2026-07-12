@@ -1,0 +1,184 @@
+# -*- coding: utf-8 -*-
+"""盘后流程模块"""
+
+import json
+from datetime import datetime, date
+from pathlib import Path
+from typing import Dict, Optional
+
+from src.data_collectors.trading_calendar import is_trading_day
+from src.data_collectors.market_data import get_market_overview
+from src.evaluation.evaluator import Evaluator
+from src.reporting.report_store import load_report
+
+
+def run_closing_pipeline(
+    dry_run: bool = False,
+    force: bool = False,
+    date_str: str = None
+) -> Dict:
+    """执行盘后流程"""
+
+    today = date_str if date_str else date.today().isoformat()
+    errors = []
+    warnings = []
+    source_status = {}
+
+    # 1. 交易日历检查
+    target_date = date.fromisoformat(today) if today else date.today()
+    if not is_trading_day(target_date):
+        return {"status": "skip", "reason": "非交易日"}
+    source_status["trading_calendar"] = "ok"
+
+    # 2. 检查当天morning.json
+    morning_report = load_report(today, "morning")
+    if not morning_report:
+        return {"status": "error", "reason": "未找到当天盘前推荐，请先运行morning"}
+    source_status["morning_report"] = "ok"
+
+    # 3. 获取收盘行情
+    try:
+        market_data = get_market_overview()
+        if "error" in market_data:
+            source_status["market_data"] = "error"
+            errors.append(f"市场数据获取失败: {market_data['error']}")
+        else:
+            source_status["market_data"] = "ok"
+    except Exception as e:
+        source_status["market_data"] = "error"
+        errors.append(f"市场数据获取失败: {e}")
+        market_data = {"error": str(e)}
+
+    # 4. 执行评估
+    try:
+        evaluator = Evaluator()
+        evaluation = evaluator.evaluate_recommendation(morning_report, today)
+
+        # 检查评估的实际状态
+        eval_status = evaluation.get("status", "unknown")
+        eval_error_rate = evaluation.get("quality", {}).get("error_rate", 0)
+
+        if eval_status == "error":
+            source_status["evaluation"] = "error"
+            warnings.append(f"评估失败: error_rate={eval_error_rate:.1%}")
+        elif eval_status == "degraded":
+            source_status["evaluation"] = "degraded"
+            warnings.append(f"评估降级: error_rate={eval_error_rate:.1%}")
+        else:
+            source_status["evaluation"] = "ok"
+
+    except Exception as e:
+        source_status["evaluation"] = "error"
+        errors.append(f"评估异常: {e}")
+        evaluation = {"status": "error", "error": str(e)}
+
+    # 5. 保存评估结果（只在评估成功或降级时保存完整评估，错误时仅保存摘要）
+    auto_sell_trades = []  # 初始化：防止评估失败时第177行UnboundLocalError
+    eval_status = evaluation.get("status", "unknown") if isinstance(evaluation, dict) else "error"
+
+    # 5.1 保存收盘报告到recommendations目录（Dashboard需要，无论评估状态如何都保存）
+    if not dry_run:
+        try:
+            from src.reporting.report_store import save_report
+            closing_report = dict(morning_report)
+            closing_report["type"] = "closing"
+            closing_report["evaluation"] = evaluation
+            closing_report["market_data"] = market_data
+            closing_report["created_at"] = datetime.now().isoformat()
+            save_report(closing_report, "closing")
+            source_status["closing_report"] = "ok"
+        except Exception as e:
+            warnings.append(f"盘后报告保存失败: {e}")
+            source_status["closing_report"] = "error"
+
+    # 5.2 保存完整评估结果（仅在评估成功/降级时）
+    if not dry_run and eval_status in ["success", "degraded"]:
+        try:
+            eval_file = evaluator.save_evaluation(evaluation)
+            source_status["save"] = "ok"
+        except Exception as e:
+            source_status["save"] = "error"
+            errors.append(f"保存失败: {e}")
+
+    # 6. 更新持仓价格（mark-to-market）+ 检查卖出信号（无论评估状态都执行）
+    if not dry_run:
+        try:
+            from src.paper_trading.auto_trader import AutoTrader
+            auto_trader = AutoTrader()
+
+            # Update all positions with current prices
+            update_result = auto_trader.update_positions(today)
+            source_status["position_update"] = "ok"
+
+            # Check for sell signals (stop-loss, target hit, expiry)
+            sell_signals = auto_trader.check_sell_signals(today)
+            if sell_signals:
+                auto_sell_trades = auto_trader.execute_sell_orders(sell_signals, today)
+                source_status["auto_sell"] = f"executed_{len(auto_sell_trades)}"
+                print(f"  🔴 自动卖出: {len(auto_sell_trades)}笔")
+            else:
+                source_status["auto_sell"] = "no_signals"
+
+        except Exception as e:
+            source_status["position_update"] = "error"
+            errors.append(f"持仓更新失败: {e}")
+            print(f"  ⚠️  持仓更新失败: {e}")
+
+    # 7. 更新推荐跟踪（无论评估状态都执行）
+    if not dry_run:
+        try:
+            from src.tracking.tracker import RecommendationTracker
+            tracker = RecommendationTracker()
+            tracking_result = tracker.track_daily(today)
+            source_status["tracking"] = "ok"
+            summary = tracking_result.get("summary", {})
+            print(f"  📊 跟踪更新: 胜率{summary.get('win_rate_pct', 0)}%")
+        except Exception as e:
+            source_status["tracking"] = "error"
+            errors.append(f"跟踪更新失败: {e}")
+
+    # 8. 生成策略建议（只在评估状态为success时）
+    if not dry_run and evaluation.get("status") == "success":
+        try:
+            from src.strategy.advisor import StrategyAdvisor
+            advisor = StrategyAdvisor()
+            advisories = advisor.generate_advisories(evaluation)
+            if advisories:
+                advisor.save_advisories(advisories)
+                source_status["strategy_advisory"] = f"generated_{len(advisories)}"
+            else:
+                source_status["strategy_advisory"] = "no_advisories"
+        except Exception as e:
+            source_status["strategy_advisory"] = "error"
+            warnings.append(f"策略建议生成失败: {e}")
+
+    # 确定整体状态
+    if errors:
+        pipeline_status = "error"
+    elif warnings:
+        pipeline_status = "degraded"
+    else:
+        pipeline_status = "success"
+
+    # 确定数据质量状态
+    eval_status = source_status.get("evaluation", "unknown")
+    if eval_status == "error":
+        data_quality = "error"
+    elif eval_status == "degraded":
+        data_quality = "degraded"
+    else:
+        data_quality = "ok"
+
+    return {
+        "status": pipeline_status,
+        "run_status": "completed",
+        "data_quality_status": data_quality,
+        "trading_status": source_status.get("position_update", "unknown"),
+        "evaluation_status": eval_status,
+        "evaluation": evaluation,
+        "market_data": market_data,
+        "source_status": source_status,
+        "errors": errors,
+        "warnings": warnings,
+        "auto_sell_trades": auto_sell_trades if not dry_run else [],
+    }

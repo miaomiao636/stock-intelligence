@@ -1,0 +1,145 @@
+{
+  "date": "2026-07-08T08:45:00+08:00",
+  "type": "morning",
+  "run_id": "sample-20260708-morning",
+  "created_at": "2026-07-08T08:45:00+08:00",
+  "data_as_of": "2026-07-08T08:45:00+08:00",
+  "strategy_version": "1.0",
+  "market_regime": "neutral",
+  "incremental_changes": {
+    "us_market": {
+      "道指": "+0.5%",
+      "纳指": "+1.2%",
+      "标普": "+0.8%"
+    },
+    "hk_market_adr": {
+      "恒指夜期": "+0.3%"
+    },
+    "polymarket": {
+      "美联储7月降息": "65%→72% ↑",
+      "中美贸易缓和": "52%→58% ↑"
+    },
+    "futures": {
+      "富时A50期货": "+0.6%"
+    }
+  },
+  "yesterday_review": {
+    "板块达标": 2,
+    "板块总数": 3,
+    "个股达标": 2,
+    "个股总数": 4
+  },
+  "sector_recommendations": [
+    {
+      "recommendation_id": "REC-20260708-S001",
+      "sector_name": "AI算力",
+      "sector_index_code": "885756",
+      "rating": 5,
+      "reason": "英伟达财报超预期+国务院政策支持",
+      "horizon": "short",
+      "horizon_days": 3,
+      "target_return_pct": 5.0,
+      "benchmark_code": "000300",
+      "entry_date": "2026-07-08T09:30:00+08:00",
+      "expiry_date": "2026-07-11T15:00:00+08:00",
+      "risk_level": "medium",
+      "incremental_basis": "美股英伟达+4.5%，AI情绪延续",
+      "status": "active"
+    },
+    {
+      "recommendation_id": "REC-2026078-S002",
+      "sector_name": "半导体",
+      "rating": 4,
+      "reason": "外围情绪带动+资金持续流入",
+      "horizon": "medium",
+      "horizon_days": 21,
+      "target_return_pct": 10.0,
+      "benchmark_code": "000300",
+      "entry_date": "2026-07-08T09:30:00+08:00",
+      "expiry_date": "2026-07-29T15:00:00+08:00",
+      "risk_level": "medium",
+      "incremental_basis": "纳指+1.2%，半导体板块联动",
+      "status": "active"
+    }
+  ],
+  "stock_recommendations": [
+    {
+      "recommendation_id": "REC-20260708-001",
+      "code": "002049",
+      "name": "紫光国微",
+      "sector": "AI算力",
+      "action": "setup_ready",
+      "horizon": "short",
+      "horizon_days": 3,
+      "target_return_pct": 8.0,
+      "target_price": 180.0,
+      "stop_loss_pct": -3.0,
+      "stop_loss_price": 158.0,
+      "reason": "AI芯片龙头",
+      "timing": {
+        "entry_condition": "回踩5日均线附近，165-168元区间",
+        "entry_rule": "trigger_price",
+        "entry_price": 166.5,
+        "risk_exit_condition": "目标位180元，风险失效位158元",
+        "target_observation_price": 180.0,
+        "stop_loss_price": 158.0
+      },
+      "entry_date": "2026-07-08T09:30:00+08:00",
+      "expiry_date": "2026-07-11T15:00:00+08:00",
+      "status": "active",
+      "board_type": "main_board",
+      "incremental_basis": "英伟达带动AI芯片情绪"
+    },
+    {
+      "recommendation_id": "REC-20260708-002",
+      "code": "002230",
+      "name": "科大讯飞",
+      "sector": "AI算力",
+      "action": "setup_ready",
+      "horizon": "short",
+      "horizon_days": 3,
+      "target_return_pct": 6.0,
+      "reason": "AI应用龙头",
+      "timing": {
+        "entry_condition": "观察触发条件",
+        "risk_exit_condition": "目标位65元，风险失效位55元"
+      },
+      "entry_date": "2026-07-08T09:30:00+08:00",
+      "expiry_date": "2026-07-11T15:00:00+08:00",
+      "status": "active",
+      "board_type": "main_board"
+    }
+  ],
+  "global_mappings": [
+    {
+      "original_code": "NVDA",
+      "original_name": "英伟达",
+      "original_market": "US",
+      "original_change": 4.5,
+      "a_share_alternatives": [
+        {"code": "002049", "name": "紫光国微", "board": "main_board", "mapping_status": "verified"},
+        {"code": "159607", "name": "半导体ETF", "board": "etf", "mapping_status": "verified"}
+      ]
+    }
+  ],
+  "risk_warnings": [
+    "英伟达带动的AI情绪可能过热，注意追高风险",
+    "中美贸易谈判本周有消息，注意波动"
+  ],
+  "news_sources": [
+    {
+      "dedup_key": "nvda-earnings-20260707",
+      "title": "英伟达Q2营收同比+122%",
+      "source": "彭博社",
+      "url": "https://www.bloomberg.com/news/nvda-earnings",
+      "published_at": "2026-07-07T06:00:00+08:00",
+      "fetched_at": "2026-07-08T08:00:00+08:00",
+      "summary": "英伟达Q2营收同比+122%，盘后涨8%",
+      "impact_direction": "positive",
+      "affected_sectors": ["AI算力", "半导体"],
+      "confidence": "high",
+      "category": "earnings",
+      "source_tier": "major_media"
+    }
+  ]
+}

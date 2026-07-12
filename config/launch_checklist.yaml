@@ -1,0 +1,10 @@
+# 启动检查清单
+# doctor或launch check会读取这个文件
+launch_ready:
+  feishu_target_confirmed: false
+  llm_provider_confirmed: false
+  news_source_priority_confirmed: false
+  risk_threshold_confirmed: false
+  recommendation_count_confirmed: false
+  benchmark_confirmed: false
+  board_permissions_confirmed: false

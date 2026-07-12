@@ -1,0 +1,20 @@
+# Stock Intelligence 依赖
+# 安装: pip install -r requirements.txt (在 .venv 中)
+# Python: >=3.11
+
+# Web 框架（server.py 依赖，原 pyproject 漏声明）
+fastapi>=0.100
+uvicorn[standard]>=0.20
+
+# 核心依赖
+click>=8.0
+python-dotenv>=1.0
+pydantic>=2.0
+pyyaml>=6.0
+requests>=2.31
+
+# LLM / 数据源
+openai>=1.0
+akshare>=1.0
+tushare>=1.4
+tavily-python>=0.3
