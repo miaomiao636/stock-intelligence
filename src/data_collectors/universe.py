@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import time
 from datetime import date, datetime
+from pathlib import Path
 from typing import Dict, List
 
 
@@ -68,27 +71,70 @@ def filter_and_rank_candidates(
     return result[:limit]
 
 
-def get_ranked_candidates(as_of_date: str, limit: int = 50) -> List[Dict]:
+def _load_or_fetch(path: Path, fetcher, max_age_seconds: int = None) -> List[Dict]:
+    """优先使用有效缓存；接口限频时允许回退到已有旧缓存。"""
+    cached = None
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as handle:
+                cached = json.load(handle)
+            if max_age_seconds is None or time.time() - path.stat().st_mtime <= max_age_seconds:
+                return cached
+        except (OSError, json.JSONDecodeError):
+            cached = None
+    try:
+        records = fetcher().to_dict("records")
+        if not records:
+            raise RuntimeError("数据源返回空记录")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, ensure_ascii=False)
+        os.replace(temp, path)
+        return records
+    except Exception:
+        if cached:
+            return cached
+        raise
+
+
+def get_ranked_candidates(
+    as_of_date: str,
+    limit: int = 50,
+    cache_dir: Path = None,
+    pro_client=None,
+) -> List[Dict]:
     token = os.getenv("TUSHARE_TOKEN")
     if not token:
         raise RuntimeError("TUSHARE_TOKEN未配置，无法建立全市场候选池")
-    import tushare as ts
-
-    pro = ts.pro_api(token)
+    if pro_client is None:
+        import tushare as ts
+        pro_client = ts.pro_api(token)
+    pro = pro_client
     trade_date = as_of_date.replace("-", "")
-    stocks = pro.stock_basic(
-        exchange="", list_status="L",
-        fields="ts_code,symbol,name,industry,list_date,market",
-    ).to_dict("records")
-    daily = pro.daily(
-        trade_date=trade_date,
-        fields="ts_code,trade_date,close,pre_close,pct_chg,vol,amount",
-    ).to_dict("records")
-    daily_basic = pro.daily_basic(
-        trade_date=trade_date,
-        fields="ts_code,trade_date,turnover_rate,total_mv,circ_mv",
-    ).to_dict("records")
+    cache_dir = Path(cache_dir or Path(__file__).parents[2] / "data" / "cache" / "universe")
+    stocks = _load_or_fetch(
+        cache_dir / "stock_basic.json",
+        lambda: pro.stock_basic(
+            exchange="", list_status="L",
+            fields="ts_code,symbol,name,industry,list_date,market",
+        ),
+        max_age_seconds=7 * 24 * 3600,
+    )
+    daily = _load_or_fetch(
+        cache_dir / f"daily_{trade_date}.json",
+        lambda: pro.daily(
+            trade_date=trade_date,
+            fields="ts_code,trade_date,close,pre_close,pct_chg,vol,amount",
+        ),
+    )
+    daily_basic = _load_or_fetch(
+        cache_dir / f"daily_basic_{trade_date}.json",
+        lambda: pro.daily_basic(
+            trade_date=trade_date,
+            fields="ts_code,trade_date,turnover_rate,total_mv,circ_mv",
+        ),
+    )
     if not stocks or not daily or not daily_basic:
         raise RuntimeError(f"Tushare在{as_of_date}返回的全市场批量数据不完整")
     return filter_and_rank_candidates(stocks, daily, daily_basic, as_of_date, limit)
-

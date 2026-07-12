@@ -33,22 +33,21 @@
 | Python compileall | 通过 |
 | Dashboard内联JavaScript语法 | 通过 |
 | API重复路由 | 0 |
-| 离线单元/API/事务/并发测试 | 38 passed，3 deselected |
+| 离线单元/API/事务/并发/缓存测试 | 39 passed，3 deselected |
 | 真实行情集成测试 | 2 passed |
-| Tushare全市场联网测试 | 1 passed |
+| Tushare全市场联网测试 | 首次1 passed；复验处于官方每小时1次限频窗口时1 skipped，缓存与SAFE_MODE测试通过 |
 | API运行态 | health/account/positions/dashboard均通过 |
 | 未授权写接口 | 正确返回401/503 |
 | 旧直接成交接口 | 正确拒绝 |
 | 定时任务 | 新crontab已安装，旧11:35 AutoTrader任务已移除 |
 | 服务 | 唯一`com.stockintelligence.server`运行中，health返回v1.0.0 |
-| `pip check` | 尚未通过：现有虚拟环境的pytest缺少`packaging`；安装请求需用户明确批准 |
+| `pip check` | 通过：No broken requirements found |
 
 ## 启用模拟交易前必须执行
 
-1. 明确批准安装缺失的`packaging`，再运行 `python -m pip check`。
-2. 配置飞书自建应用、接收ID、Verification Token及回调地址，完成三个按钮实测。
-3. 配置`API_KEY`；在此之前所有写API保持关闭。
-4. 保持 `PAPER_TRADING_ENABLED=false`，先运行至少20个交易日shadow mode。
+1. 配置飞书自建应用、接收ID、Verification Token及回调地址，完成三个按钮实测。
+2. 配置`API_KEY`；在此之前所有写API保持关闭。
+3. 保持 `PAPER_TRADING_ENABLED=false`，先运行至少20个交易日shadow mode。
 
 ## 未放行事项
 

@@ -49,7 +49,12 @@ def test_get_market_overview():
 @pytest.mark.skipif(not os.getenv("TUSHARE_TOKEN"), reason="TUSHARE_TOKEN未配置")
 def test_full_market_candidate_pool_live():
     from src.data_collectors.universe import get_ranked_candidates
-    result = get_ranked_candidates("2026-07-10", limit=10)
+    try:
+        result = get_ranked_candidates("2026-07-10", limit=10)
+    except Exception as exc:
+        if "频率超限" in str(exc):
+            pytest.skip("Tushare账户当前处于官方限频窗口；缓存行为由单元测试覆盖")
+        raise
     assert result
     assert all(item["daily_amount"] >= 50_000_000 for item in result)
 

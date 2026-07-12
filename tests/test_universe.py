@@ -21,3 +21,33 @@ def test_universe_applies_point_in_time_hard_filters():
     result = filter_and_rank_candidates(stocks, daily, basics, "2026-07-10")
     assert [item["code"] for item in result] == ["000001"]
 
+
+def test_universe_cache_avoids_repeated_rate_limited_calls(tmp_path, monkeypatch):
+    from src.data_collectors.universe import get_ranked_candidates
+
+    monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
+
+    class Frame:
+        def __init__(self, records):
+            self.records = records
+        def to_dict(self, orient):
+            assert orient == "records"
+            return self.records
+
+    class Pro:
+        calls = 0
+        def stock_basic(self, **kwargs):
+            self.calls += 1
+            return Frame([{"ts_code": "000001.SZ", "symbol": "000001", "name": "平安银行", "industry": "银行", "list_date": "19910403"}])
+        def daily(self, **kwargs):
+            self.calls += 1
+            return Frame([{"ts_code": "000001.SZ", "close": 10, "pre_close": 9.9, "pct_chg": 1, "amount": 100000}])
+        def daily_basic(self, **kwargs):
+            self.calls += 1
+            return Frame([{"ts_code": "000001.SZ", "total_mv": 500000, "turnover_rate": 2}])
+
+    pro = Pro()
+    first = get_ranked_candidates("2026-07-10", cache_dir=tmp_path, pro_client=pro)
+    second = get_ranked_candidates("2026-07-10", cache_dir=tmp_path, pro_client=pro)
+    assert first == second
+    assert pro.calls == 3
