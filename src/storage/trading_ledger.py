@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+import math
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -123,6 +124,13 @@ class TradingLedger:
                     captured_at TEXT UNIQUE NOT NULL,
                     total_equity REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cash_adjustments (
+                    adjustment_id TEXT PRIMARY KEY,
+                    amount REAL NOT NULL,
+                    previous_cash REAL NOT NULL,
+                    new_cash REAL NOT NULL CHECK(new_cash >= 0),
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS strategy_versions (
                     version_id TEXT PRIMARY KEY,
                     role TEXT NOT NULL CHECK(role IN ('champion','challenger','archived')),
@@ -134,6 +142,7 @@ class TradingLedger:
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON trading_orders(status);
                 CREATE INDEX IF NOT EXISTS idx_lots_code ON position_lots(code);
                 CREATE INDEX IF NOT EXISTS idx_trades_date ON trading_trades(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_cash_adjustments_created_at ON cash_adjustments(created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_single_champion ON strategy_versions(role) WHERE role='champion';
                 """
             )
@@ -153,7 +162,7 @@ class TradingLedger:
             if exists and not reset:
                 return self.get_account(conn)
             if reset:
-                for table in ("trading_decisions", "position_lots", "trading_trades", "trading_orders", "equity_snapshots"):
+                for table in ("trading_decisions", "position_lots", "trading_trades", "trading_orders", "equity_snapshots", "cash_adjustments"):
                     conn.execute(f"DELETE FROM {table}")
             conn.execute(
                 "INSERT OR REPLACE INTO trading_accounts(account_id,initial_cash,cash,realized_pnl,created_at,updated_at) VALUES('default',?,?,?,?,?)",
@@ -168,16 +177,61 @@ class TradingLedger:
             row = conn.execute("SELECT * FROM trading_accounts WHERE account_id='default'").fetchone()
             if not row:
                 raise RuntimeError("模拟账户尚未初始化")
-            market_value = conn.execute(
-                "SELECT COALESCE(SUM(quantity * current_price),0) FROM position_lots WHERE quantity>0"
-            ).fetchone()[0]
+            market_value, cost_value = conn.execute(
+                "SELECT COALESCE(SUM(quantity * current_price),0),"
+                "COALESCE(SUM(quantity * avg_cost),0) FROM position_lots WHERE quantity>0"
+            ).fetchone()
             data = dict(row)
             data["market_value"] = round(float(market_value), 2)
             data["total_equity"] = round(data["cash"] + data["market_value"], 2)
+            data["unrealized_pnl"] = round(float(market_value) - float(cost_value), 2)
+            net_cash_adjustment = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM cash_adjustments"
+            ).fetchone()[0]
+            data["net_cash_adjustment"] = round(float(net_cash_adjustment), 2)
+            data["adjusted_principal"] = round(
+                float(data["initial_cash"]) + data["net_cash_adjustment"], 2
+            )
+            data["net_pnl_after_costs"] = round(
+                data["total_equity"] - data["adjusted_principal"], 2
+            )
             return data
         finally:
             if own:
                 conn.close()
+
+    def update_available_cash(self, cash: float) -> Dict:
+        """调整可用现金，并以外部资金流记录保证收益率不被充值/取现污染。"""
+        cash = float(cash)
+        if not math.isfinite(cash) or cash <= 0:
+            raise ValueError("可用现金必须大于0")
+        cash = round(cash, 2)
+        now = datetime.now().astimezone().isoformat()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT cash FROM trading_accounts WHERE account_id='default'"
+            ).fetchone()
+            if not row:
+                raise RuntimeError("模拟账户尚未初始化")
+            previous_cash = round(float(row["cash"]), 2)
+            amount = round(cash - previous_cash, 2)
+            if amount:
+                conn.execute(
+                    "INSERT INTO cash_adjustments(adjustment_id,amount,previous_cash,new_cash,created_at) VALUES(?,?,?,?,?)",
+                    (f"CASH-{uuid.uuid4().hex}", amount, previous_cash, cash, now),
+                )
+            conn.execute(
+                "UPDATE trading_accounts SET cash=?, updated_at=? WHERE account_id='default'",
+                (cash, now),
+            )
+        return self.get_account()
+
+    def cash_adjustments(self) -> List[Dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT amount, created_at FROM cash_adjustments ORDER BY created_at"
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def create_order(self, payload: Dict, now: datetime) -> Dict:
         order_id = payload.get("order_id") or f"ORD-{now:%Y%m%d}-{uuid.uuid4().hex[:12]}"
@@ -260,12 +314,13 @@ class TradingLedger:
             )
             return cursor.rowcount == 1
 
-    def pause_day(self, trade_date: str, now: datetime) -> None:
+    def pause_day(self, trade_date: str, now: datetime, actor: str) -> None:
         with self.transaction() as conn:
             conn.execute(
-                "UPDATE trading_orders SET status='paused_for_day',decision='pause_day',updated_at=? "
+                "UPDATE trading_orders SET status='paused_for_day',decision='pause_day',"
+                "decision_actor=?,decided_at=?,updated_at=? "
                 "WHERE substr(created_at,1,10)=? AND status IN ('proposed','pre_notified','final_notified','confirmed')",
-                (now.isoformat(), trade_date),
+                (actor, now.isoformat(), now.isoformat(), trade_date),
             )
 
     def is_day_paused(self, trade_date: str) -> bool:
@@ -327,6 +382,11 @@ class TradingLedger:
                 conn.execute(
                     "UPDATE position_lots SET current_price=?,highest_price=MAX(highest_price,?),updated_at=? WHERE code=? AND quantity>0",
                     (price, price, now.isoformat(), code),
+                )
+            if prices:
+                conn.execute(
+                    "UPDATE trading_accounts SET updated_at=? WHERE account_id='default'",
+                    (now.isoformat(),),
                 )
 
     def risk_levels(self, recommendation_id: str) -> Dict:

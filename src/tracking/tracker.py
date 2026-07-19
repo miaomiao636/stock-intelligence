@@ -10,11 +10,53 @@ from typing import Dict, List, Optional
 class RecommendationTracker:
     """Track and evaluate historical stock recommendations"""
 
+    TERMINAL_STATUSES = {"hit_target", "stopped_out", "deep_loss", "expired"}
+
     def __init__(self, data_dir: Path = None):
         self.data_dir = data_dir or Path(__file__).parent.parent.parent / "data"
         self.tracker_dir = self.data_dir / "tracker"
         self.tracker_dir.mkdir(parents=True, exist_ok=True)
         self.recommendations_dir = self.data_dir / "recommendations"
+
+    @staticmethod
+    def _number(value, default=0):
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _is_actionable(stock: Dict) -> bool:
+        """Only score recommendations that were actually ready to enter.
+
+        Older reports did not always include an action field; those remain
+        eligible for backward compatibility. Explicit track/watch ideas are
+        observations, not trades, and must not contaminate win-rate metrics.
+        """
+        action = str(stock.get("action") or "").strip().lower()
+        return (
+            action in {"", "setup_ready", "buy"}
+            and stock.get("trade_eligible", True) is not False
+        )
+
+    def _load_previous_states(self, date_str: str) -> Dict[str, Dict]:
+        """Load the newest known state for every recommendation up to date_str."""
+        states: Dict[str, Dict] = {}
+        if not self.tracker_dir.exists():
+            return states
+        for path in sorted(self.tracker_dir.glob("*.json"), reverse=True):
+            if path.stem > date_str:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            for track in payload.get("tracks", []):
+                key = f"{track.get('recommendation_date', '')}:{track.get('code', '')}"
+                states.setdefault(key, track)
+        return states
 
     def track_daily(self, date_str: str = None) -> Dict:
         """Run daily tracking for all historical recommendations.
@@ -29,6 +71,8 @@ class RecommendationTracker:
             date_str = date.today().isoformat()
 
         all_tracks = []
+        excluded_non_actionable = 0
+        previous_states = self._load_previous_states(date_str)
 
         # Scan all recommendation dates
         if not self.recommendations_dir.exists():
@@ -56,7 +100,18 @@ class RecommendationTracker:
 
             # Track each stock
             for stock in stocks:
+                if not self._is_actionable(stock):
+                    excluded_non_actionable += 1
+                    continue
                 track = self._track_stock(stock, rec_date, date_str)
+                key = f"{rec_date}:{track.get('code', '')}"
+                previous = previous_states.get(key)
+                if previous and previous.get("status") in self.TERMINAL_STATUSES:
+                    # A terminal outcome is immutable. A later price must not
+                    # turn a previous hit/stop back into an active sample.
+                    track = dict(previous)
+                elif track.get("status") in self.TERMINAL_STATUSES:
+                    track["terminal_at"] = datetime.now().isoformat()
                 all_tracks.append(track)
 
         # Save tracking results
@@ -64,6 +119,7 @@ class RecommendationTracker:
             "tracking_date": date_str,
             "tracked_at": datetime.now().isoformat(),
             "total_tracked": len(all_tracks),
+            "excluded_non_actionable": excluded_non_actionable,
             "tracks": all_tracks,
             "summary": self._calculate_summary(all_tracks),
         }
@@ -80,9 +136,9 @@ class RecommendationTracker:
         entry_price = stock.get("entry_price", 0) or stock.get("timing", {}).get("entry_price", 0)
         target_price = stock.get("target_price", 0) or stock.get("timing", {}).get("target_observation_price", 0)
         stop_loss = stock.get("stop_loss_price", 0) or stock.get("timing", {}).get("stop_loss_price", 0)
-        target_return = stock.get("target_return_pct", 0)
+        target_return = self._number(stock.get("target_return_pct"), 0)
         horizon = stock.get("horizon", "short")
-        horizon_days = stock.get("horizon_days", 3)
+        horizon_days = int(self._number(stock.get("horizon_days"), 3) or 3)
 
         # Fetch current price
         current_price = self._fetch_price(code)
@@ -100,7 +156,7 @@ class RecommendationTracker:
                 else:
                     target_price = round(entry_price * 1.05, 2)  # Default +5%
             if not stop_loss or stop_loss <= 0:
-                sl_pct = abs(stock.get("stop_loss_pct", 5))
+                sl_pct = abs(self._number(stock.get("stop_loss_pct"), 5))
                 stop_loss = round(entry_price * (1 - sl_pct / 100), 2)
 
         # Calculate returns
@@ -245,7 +301,10 @@ class RecommendationTracker:
         avg_win = sum(winners) / len(winners) if winners else 0
         avg_loss = sum(losers) / len(losers) if losers else 0
 
-        win_rate = hit / total * 100 if total > 0 else 0
+        failed = stopped + deep_loss + expired
+        closed = hit + failed
+        pending = total - closed
+        win_rate = hit / closed * 100 if closed > 0 else 0
 
         # Sector analysis
         sector_stats = {}
@@ -267,7 +326,8 @@ class RecommendationTracker:
                 "total": data["total"],
                 "hit": data["hit"],
                 "failed": data["failed"],
-                "win_rate": round(data["hit"] / data["total"] * 100, 1) if data["total"] > 0 else 0,
+                "closed": data["hit"] + data["failed"],
+                "win_rate": round(data["hit"] / (data["hit"] + data["failed"]) * 100, 1) if data["hit"] + data["failed"] > 0 else 0,
                 "avg_return": round(sum(data["returns"]) / len(data["returns"]), 2) if data["returns"] else 0,
             }
 
@@ -278,7 +338,11 @@ class RecommendationTracker:
             "active": active,
             "deep_loss": deep_loss,
             "expired": expired,
+            "closed_samples": closed,
+            "pending_samples": pending,
+            "sample_coverage_pct": round(closed / total * 100, 1) if total else 0,
             "win_rate_pct": round(win_rate, 1),
+            "win_rate_basis": "closed_samples_only",
             "avg_return_pct": round(avg_return, 2),
             "avg_win_pct": round(avg_win, 2),
             "avg_loss_pct": round(avg_loss, 2),

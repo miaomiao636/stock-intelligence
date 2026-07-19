@@ -2,11 +2,55 @@
 """输出校验模块"""
 
 import json
+import re
 from typing import Dict, Tuple
 
 from pydantic import ValidationError
 
 from src.models import Recommendation
+
+
+def _extract_json_text(raw_output: str) -> str:
+    """从代码块或说明文字中提取最外层 JSON 对象。"""
+    text = str(raw_output or "").lstrip("\ufeff").strip()
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = next((item for item in fenced if "{" in item), fenced[0]).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end >= start:
+        text = text[start:end + 1]
+    return text.strip()
+
+
+def _remove_trailing_commas(text: str) -> str:
+    """安全移除对象/数组结尾逗号，不触碰字符串内部内容。"""
+    result = []
+    in_string = False
+    escaped = False
+    length = len(text)
+    for index, char in enumerate(text):
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            continue
+        if char == ",":
+            cursor = index + 1
+            while cursor < length and text[cursor].isspace():
+                cursor += 1
+            if cursor < length and text[cursor] in "]}":
+                continue
+        result.append(char)
+    return "".join(result)
 
 
 def validate_llm_output(raw_output: str) -> Tuple[bool, Dict, str]:
@@ -17,14 +61,8 @@ def validate_llm_output(raw_output: str) -> Tuple[bool, Dict, str]:
     """
     # 1. 尝试解析JSON
     try:
-        # 提取JSON部分（处理可能的markdown代码块）
-        json_str = raw_output
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0]
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0]
-        
-        data = json.loads(json_str.strip())
+        json_str = _remove_trailing_commas(_extract_json_text(raw_output))
+        data = json.loads(json_str)
     except json.JSONDecodeError as e:
         return False, {}, f"JSON解析失败: {e}"
     

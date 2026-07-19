@@ -35,27 +35,35 @@ def calculate_max_drawdown(prices: list) -> float:
 
 
 def calculate_win_rate(results: list) -> float:
-    """计算胜率（含中间状态：浮盈和接近目标也算部分成功）"""
-    # 过滤掉status=error的记录
-    valid_results = [r for r in results if r.get("status") != "error"]
+    """计算已结束样本的真实胜率；进行中的推荐不进入分母。"""
+    win_statuses = {"hit", "hit_target"}
+    loss_statuses = {"stopped", "stopped_out", "deep_loss", "expired"}
+    closed_results = [
+        r for r in results
+        if r.get("status") in win_statuses | loss_statuses
+    ]
+    if not closed_results:
+        return 0.0
+    wins = sum(1 for r in closed_results if r.get("status") in win_statuses)
+    return wins / len(closed_results) * 100
 
+
+def calculate_progress_score(results: list) -> float:
+    """进行中表现分，仅用于观察进度，不得标记为胜率。"""
+    valid_results = [r for r in results if r.get("status") != "error"]
     if not valid_results:
         return 0.0
 
-    # 达标=完全成功，接近目标=较高成功，浮盈=部分成功
     wins = 0
     for r in valid_results:
         status = r.get("status", "")
         ret = r.get("return_pct", 0)
 
         if status == "hit":
-            # 完全达标
             wins += 1.0
         elif status == "near_target":
-            # 接近目标（>=70%），给予更高权重
             wins += 0.75
         elif ret > 0:
-            # 浮盈但未达标
             wins += 0.5
 
     return wins / len(valid_results) * 100
@@ -93,7 +101,11 @@ def calculate_metrics(
     # 计算各项指标
     avg_return = sum(returns) / len(returns) if returns else 0
     win_rate = calculate_win_rate(stock_results)
-    profit_loss_ratio = calculate_profit_loss_ratio(stock_results)
+    progress_score = calculate_progress_score(stock_results)
+    closed_statuses = {"hit", "hit_target", "stopped", "stopped_out", "deep_loss", "expired"}
+    closed_results = [r for r in valid_results if r.get("status") in closed_statuses]
+    active_count = len(valid_results) - len(closed_results)
+    profit_loss_ratio = calculate_profit_loss_ratio(closed_results)
     
     # 计算超额收益
     excess_returns = [r - benchmark_return for r in returns]
@@ -115,6 +127,11 @@ def calculate_metrics(
         "avg_excess_return_pct": round(avg_excess, 2),
         "benchmark_return_pct": round(benchmark_return, 2),
         "win_rate_pct": round(win_rate, 2),
+        "win_rate_basis": "closed_samples_only",
+        "closed_recommendations": len(closed_results),
+        "active_recommendations": active_count,
+        "sample_coverage_pct": round(len(closed_results) / len(valid_results) * 100, 2) if valid_results else 0,
+        "progress_score_pct": round(progress_score, 2),
         "profit_loss_ratio": round(profit_loss_ratio, 2),
         "max_return_pct": round(max(returns), 2) if returns else 0,
         "min_return_pct": round(min(returns), 2) if returns else 0,

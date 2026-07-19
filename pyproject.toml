@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "requests>=2.31",
+    "lark-channel-sdk==1.1.0",
     "openai>=1.0",
     "akshare>=1.0",
     "tavily-python>=0.3",

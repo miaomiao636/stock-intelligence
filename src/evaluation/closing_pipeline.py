@@ -73,7 +73,8 @@ def run_closing_pipeline(
         evaluation = {"status": "error", "error": str(e)}
 
     # 5. 保存评估结果（只在评估成功或降级时保存完整评估，错误时仅保存摘要）
-    auto_sell_trades = []  # 初始化：防止评估失败时第177行UnboundLocalError
+    auto_sell_trades = []  # 兼容旧报告字段；新流程不再直接自动卖出
+    exit_alerts = []
     eval_status = evaluation.get("status", "unknown") if isinstance(evaluation, dict) else "error"
 
     # 5.1 保存收盘报告到recommendations目录（Dashboard需要，无论评估状态如何都保存）
@@ -100,42 +101,49 @@ def run_closing_pipeline(
             source_status["save"] = "error"
             errors.append(f"保存失败: {e}")
 
-    # 6. 更新持仓价格（mark-to-market）+ 检查卖出信号（无论评估状态都执行）
+    # 6. SQLite 账本盯市 + 生成飞书卖出计划。历史补跑不得触碰实时持仓。
     if not dry_run:
-        try:
-            from src.paper_trading.auto_trader import AutoTrader
-            auto_trader = AutoTrader()
+        if today != date.today().isoformat():
+            source_status["position_update"] = "skipped_historical_run"
+            source_status["exit_plan"] = "skipped_historical_run"
+        else:
+            try:
+                from src.paper_trading.workflow import PaperTradingWorkflow
 
-            # Update all positions with current prices
-            update_result = auto_trader.update_positions(today)
-            source_status["position_update"] = "ok"
-
-            # Check for sell signals (stop-loss, target hit, expiry)
-            sell_signals = auto_trader.check_sell_signals(today)
-            if sell_signals:
-                auto_sell_trades = auto_trader.execute_sell_orders(sell_signals, today)
-                source_status["auto_sell"] = f"executed_{len(auto_sell_trades)}"
-                print(f"  🔴 自动卖出: {len(auto_sell_trades)}笔")
-            else:
-                source_status["auto_sell"] = "no_signals"
-
-        except Exception as e:
-            source_status["position_update"] = "error"
-            errors.append(f"持仓更新失败: {e}")
-            print(f"  ⚠️  持仓更新失败: {e}")
+                trading_result = PaperTradingWorkflow().intraday_check()
+                trading_state = trading_result.get("status", "error")
+                exit_alerts = trading_result.get("alerts", [])
+                if trading_state == "success":
+                    source_status["position_update"] = "ok"
+                    source_status["exit_plan"] = (
+                        f"alerts_{len(exit_alerts)}" if exit_alerts else "no_change"
+                    )
+                elif trading_state == "disabled":
+                    source_status["position_update"] = "disabled"
+                    source_status["exit_plan"] = "disabled"
+                else:
+                    source_status["position_update"] = "error"
+                    errors.append(f"SQLite持仓盯市失败: {trading_result.get('reason', trading_state)}")
+            except Exception as e:
+                source_status["position_update"] = "error"
+                errors.append(f"SQLite持仓盯市失败: {e}")
+                print(f"  ⚠️  SQLite持仓盯市失败: {e}")
 
     # 7. 更新推荐跟踪（无论评估状态都执行）
     if not dry_run:
-        try:
-            from src.tracking.tracker import RecommendationTracker
-            tracker = RecommendationTracker()
-            tracking_result = tracker.track_daily(today)
-            source_status["tracking"] = "ok"
-            summary = tracking_result.get("summary", {})
-            print(f"  📊 跟踪更新: 胜率{summary.get('win_rate_pct', 0)}%")
-        except Exception as e:
-            source_status["tracking"] = "error"
-            errors.append(f"跟踪更新失败: {e}")
+        if today != date.today().isoformat():
+            source_status["tracking"] = "skipped_historical_run"
+        else:
+            try:
+                from src.tracking.tracker import RecommendationTracker
+                tracker = RecommendationTracker()
+                tracking_result = tracker.track_daily(today)
+                source_status["tracking"] = "ok"
+                summary = tracking_result.get("summary", {})
+                print(f"  📊 跟踪更新: 已结束样本胜率{summary.get('win_rate_pct', 0)}%")
+            except Exception as e:
+                source_status["tracking"] = "error"
+                errors.append(f"跟踪更新失败: {e}")
 
     # 8. 生成策略建议（只在评估状态为success时）
     if not dry_run and evaluation.get("status") == "success":
@@ -181,4 +189,5 @@ def run_closing_pipeline(
         "errors": errors,
         "warnings": warnings,
         "auto_sell_trades": auto_sell_trades if not dry_run else [],
+        "exit_alerts": exit_alerts if not dry_run else [],
     }

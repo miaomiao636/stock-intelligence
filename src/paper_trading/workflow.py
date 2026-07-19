@@ -38,8 +38,18 @@ class PaperTradingWorkflow:
             return {"status": "safe_mode", "orders": [], "reason": "LLM或数据降级，禁止开仓"}
         if not str(source_status.get("candidate_universe", "")).startswith("ok_"):
             return {"status": "safe_mode", "orders": [], "reason": "全市场候选池未通过，禁止开仓"}
+        regime = report.get("market_regime", "neutral")
+        if regime in {"bearish", "high_volatility"}:
+            return {"status": "safe_mode", "orders": [], "reason": f"市场状态{regime}，¥4,000账户暂停新开仓"}
         if not self.notifier.is_interactive_available():
             return {"status": "safe_mode", "orders": [], "reason": "飞书双向交互未配置"}
+        callback_health = self.notifier.check_callback_reachable()
+        if not callback_health.get("reachable"):
+            return {
+                "status": "safe_mode",
+                "orders": [],
+                "reason": f"飞书回调不可用，禁止生成自动订单：{callback_health.get('reason') or '未知原因'}",
+            }
 
         candidates = [
             stock for stock in report.get("stock_recommendations", [])
@@ -49,9 +59,6 @@ class PaperTradingWorkflow:
         quotes = self.quote_fetcher(codes)
         account = self.service.get_account()
         self.service.record_equity_snapshot(account["total_equity"], at=self.service.now().isoformat())
-        regime = report.get("market_regime", "neutral")
-        if regime in {"bearish", "high_volatility"}:
-            return {"status": "safe_mode", "orders": [], "reason": f"市场状态{regime}，¥4,000账户暂停新开仓"}
         run_id = report.get("run_id") or f"{self.service.now().date().isoformat()}-open"
         prepared, rejected = [], []
 
@@ -107,15 +114,30 @@ class PaperTradingWorkflow:
             ["confirmed", "final_notified"], self.service.now().date().isoformat()
         )
         now = self.service.now()
-        orders = [
+        confirmed_orders = [order for order in candidates if order["status"] == "confirmed"]
+        timeout_orders = [
             order for order in candidates
-            if order["status"] == "confirmed"
-            or (order.get("veto_deadline") and datetime.fromisoformat(order["veto_deadline"]) <= now)
+            if order["status"] == "final_notified"
+            and order.get("veto_deadline")
+            and datetime.fromisoformat(order["veto_deadline"]) <= now
         ]
-        if not orders:
-            return {"status": "success", "results": []}
-        quotes = self.quote_fetcher([o["code"] for o in orders])
         results = []
+        if timeout_orders:
+            callback_health = self.notifier.check_callback_reachable()
+            if not callback_health.get("reachable"):
+                error = "飞书回调不可用，已取消超时自动执行"
+                for order in timeout_orders:
+                    rejected = self.service.reject_uncertain_callback(order["order_id"], error)
+                    results.append({"success": False, "error": error, "order": rejected})
+                    self.notifier.send_message(
+                        "模拟订单已安全取消",
+                        f"{order['name']}（{order['code']}）\n{error}",
+                    )
+                timeout_orders = []
+        orders = confirmed_orders + timeout_orders
+        if not orders:
+            return {"status": "success", "results": results}
+        quotes = self.quote_fetcher([o["code"] for o in orders])
         for order in orders:
             quote = quotes.get(order["code"])
             if not quote:
@@ -132,6 +154,8 @@ class PaperTradingWorkflow:
 
     def intraday_check(self) -> Dict:
         """每30分钟盯市；无状态变化不推送。"""
+        if not self.enabled():
+            return {"status": "disabled", "positions": 0, "alerts": []}
         positions = self.service.get_positions()
         if not positions:
             return {"status": "success", "positions": 0, "alerts": []}

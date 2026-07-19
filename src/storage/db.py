@@ -133,6 +133,20 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_date ON recommendations(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_date_type ON recommendations(date, type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_evaluations_date ON evaluations(date)")
+    # 一个交易日/报告类型只有一份审计副本；清理旧版本留下的重复行后再加约束。
+    cursor.execute("""
+        DELETE FROM recommendations
+        WHERE id NOT IN (SELECT MAX(id) FROM recommendations GROUP BY date, type)
+    """)
+    cursor.execute("""
+        DELETE FROM evaluations
+        WHERE id NOT IN (
+            SELECT MAX(id) FROM evaluations
+            GROUP BY date, recommendation_date, recommendation_type
+        )
+    """)
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendations_business_key ON recommendations(date, type)")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_evaluations_business_key ON evaluations(date, recommendation_date, recommendation_type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_published ON news_sources(published_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_news_category ON news_sources(category)")
 

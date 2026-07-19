@@ -22,14 +22,147 @@ def test_mutating_api_is_closed_without_api_key(monkeypatch):
     assert response.status_code == 503
 
 
-def test_feishu_callback_has_independent_token_auth(monkeypatch):
+def test_read_account_is_public_but_cash_update_requires_api_key(monkeypatch):
+    """看盘不应要求密钥；任何资金变更仍必须由服务端校验密钥。"""
+    class StubTradingService:
+        def get_account(self):
+            return {"cash": 4000.0}
+
+        def update_available_cash(self, cash):
+            return {"cash": cash, "adjusted_principal": cash}
+
+    monkeypatch.setattr(server, "API_KEY", "test-key")
+    monkeypatch.setattr("src.paper_trading.trading_service.TradingService", StubTradingService)
+    client = TestClient(server.app)
+
+    assert client.get("/api/account").status_code == 200
+    denied = client.put("/api/account", json={"cash": 5200})
+    allowed = client.put(
+        "/api/account",
+        json={"cash": 5200},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    assert allowed.json()["account"]["cash"] == 5200
+
+
+def test_manual_analysis_regeneration_is_authenticated_and_compact(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", "test-key")
+    monkeypatch.setattr(
+        "src.orchestrator.run_morning_pipeline",
+        lambda **kwargs: {
+            "status": "success",
+            "source_status": {"llm": "success"},
+            "errors": [],
+            "report": {"date": "2026-07-14"},
+        },
+    )
+    client = TestClient(server.app)
+
+    denied = client.post("/api/recommendation/regenerate")
+    response = client.post(
+        "/api/recommendation/regenerate",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert denied.status_code == 401
+    assert response.status_code == 200
+    assert response.json()["data"]["llm_status"] == "success"
+    assert "report" not in response.json()["data"]
+
+
+def test_feishu_callback_returns_challenge_for_url_verification(monkeypatch):
     monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "expected")
     client = TestClient(server.app)
     response = client.post(
         "/api/feishu/callback",
         json={"type": "url_verification", "token": "wrong", "challenge": "x"},
     )
+    assert response.status_code == 200
+    assert response.json()["challenge"] == "x"
+
+
+def test_feishu_callback_has_independent_token_auth(monkeypatch):
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "expected")
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/feishu/callback",
+        json={"header": {"event_id": "evt-0"}, "event": {"action": {"value": {"action": "ping"}}}},
+    )
     assert response.status_code == 401
+
+
+def test_feishu_callback_probe_ping(monkeypatch):
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "expected")
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/feishu/callback",
+        json={
+            "token": "expected",
+            "header": {"event_id": "evt-1"},
+            "event": {
+                "operator": {"open_id": "ou_xxx"},
+                "action": {"value": {"action": "ping", "order_id": "feishu-probe"}},
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["toast"]["content"] == "飞书回调链路正常"
+
+
+def test_feishu_callback_unknown_payload_is_not_fatal(monkeypatch):
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "expected")
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/feishu/callback",
+        json={"token": "expected", "event": {"action": {"value": {"foo": "bar"}}}},
+    )
+    assert response.status_code == 200
+    assert "回调已收到" in response.json()["toast"]["content"]
+
+
+def test_feishu_callback_legacy_ping_is_accepted(monkeypatch):
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "expected")
+    client = TestClient(server.app)
+    response = client.post(
+        "/api/feishu/callback",
+        headers={
+            "x-lark-signature": "sig",
+            "x-lark-request-timestamp": "ts",
+        },
+        json={
+            "app_id": "cli_test",
+            "open_message_id": "om_xxx",
+            "open_chat_id": "oc_xxx",
+            "action": {"value": {"action": "ping", "order_id": "feishu-probe"}, "tag": "button"},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["toast"]["content"] == "飞书回调链路正常"
+
+
+def test_feishu_callback_does_not_persist_raw_secrets(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "expected")
+    debug_log = tmp_path / "feishu_callback_debug.log"
+    monkeypatch.setattr(server, "FEISHU_DEBUG_LOG", debug_log, raising=False)
+    client = TestClient(server.app)
+    marker = "sensitive-marker-must-not-be-logged"
+
+    response = client.post(
+        "/api/feishu/callback",
+        headers={"x-sensitive-test": marker},
+        json={
+            "token": "expected",
+            "event": {"action": {"value": {"action": "ping", "note": marker}}},
+        },
+    )
+
+    assert response.status_code == 200
+    assert not debug_log.exists()
+    assert marker not in caplog.text
 
 
 def test_latest_quote_does_not_rewrite_historical_signal(monkeypatch):

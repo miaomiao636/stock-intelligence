@@ -16,11 +16,91 @@ load_dotenv()
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
 
+REPORTABLE_STATUSES = {"success", "partial_success", "degraded"}
+
+
+def _source_status_icon(status: str) -> str:
+    """把来源状态映射为不会误报的CLI图标。"""
+    value = str(status or "")
+    if value in {"ok", "success"} or value.startswith("ok_"):
+        return "✅"
+    if value in {"degraded", "fallback"}:
+        return "⚠️"
+    if value.startswith("deferred_"):
+        return "ℹ️"
+    return "❌"
+
+
+def _format_report_notification(date_str: str, mode: str, report: dict, result: dict | None = None) -> str:
+    """为定时推送与手动补发生成同一份报告内容。"""
+    result = result or {}
+    if mode == "closing":
+        from src.reporting.formatter import format_closing_report
+
+        return format_closing_report(
+            date_str=date_str,
+            market_data=result.get("market_data") or report.get("market_data", {}),
+            evaluation=result.get("evaluation") or report.get("evaluation", {}),
+            warnings=result.get("warnings") or report.get("warnings", []),
+        )
+
+    from src.reporting.formatter import format_morning_report
+
+    content = format_morning_report(
+        date_str=date_str,
+        market_data=report.get("market_data", {}),
+        news_list=report.get("news_sources", []),
+        sector_recommendations=report.get("sector_recommendations", []),
+        stock_recommendations=report.get("stock_recommendations", []),
+    )
+    candidates = [
+        stock for stock in report.get("stock_recommendations", [])
+        if stock.get("action") == "setup_ready" and stock.get("trade_eligible", True)
+    ]
+    if candidates:
+        content += "\n\n📌 08:50盘前候选（只读，不执行）\n"
+        for stock in candidates[:4]:
+            content += (
+                f"  • {stock.get('name', '')}({stock.get('code', '')}) "
+                f"参考价¥{stock.get('current_price') or stock.get('entry_price') or 0}\n"
+            )
+        content += "09:35将获取当日行情重算，并另发最终交互卡片。"
+    return content
+
+
+def _deliver_report_notification(date_str: str, mode: str, content: str, source: str) -> dict:
+    """发送报告并保存回执；发送成功但回执落盘失败也视为需要人工关注。"""
+    from src.notifier.feishu import FeishuNotifier
+    from src.notifier.report_delivery import record_delivery
+
+    notifier = FeishuNotifier()
+    if notifier.is_available():
+        notify_result = notifier.send_report(content, mode)
+    else:
+        notify_result = {"status": "error", "message": "飞书发送配置不可用"}
+    try:
+        record_delivery(date_str, mode, notify_result, source)
+    except Exception as exc:
+        if notify_result.get("status") == "success":
+            return {"status": "error", "message": f"飞书已发送，但本地回执保存失败: {exc}"}
+    return notify_result
+
 
 @click.group()
 def cli():
     """Stock Intelligence - 智能选股分析系统"""
     pass
+
+
+@cli.command("reconcile")
+def reconcile_workflow():
+    """开机/唤醒后检查并补跑缺失的关键阶段。"""
+    from src.automation.reconcile import run_reconcile
+
+    result = run_reconcile()
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("status") == "error":
+        raise click.ClickException(f"自动补偿失败: {result.get('stage') or 'unknown'}")
 
 
 @cli.command()
@@ -132,11 +212,58 @@ def doctor():
         results.append(("WARN", "SQLite 未初始化（运行 init 命令）"))
     
     # 检查飞书配置
+    from src.notifier.feishu import FeishuNotifier
+
+    notifier = FeishuNotifier()
     feishu_url = os.getenv("FEISHU_WEBHOOK_URL")
     if feishu_url:
-        results.append(("PASS", "飞书 Webhook 已配置"))
+        results.append(("PASS", "飞书 Webhook 已配置（普通报告可推送）"))
     else:
-        results.append(("WARN", "飞书 Webhook 未配置（不推送，仅本地存档）"))
+        results.append(("WARN", "飞书 Webhook 未配置（普通报告将不推送）"))
+
+    missing_interactive = notifier.interactive_missing_fields()
+    if missing_interactive:
+        results.append(("WARN", f"飞书交互卡片未就绪，缺少: {', '.join(missing_interactive)}"))
+    else:
+        results.append(("PASS", f"飞书交互卡片参数已配置（接收类型: {notifier.receive_id_type}）"))
+
+    callback_url = notifier.callback_url()
+    callback_health = notifier.check_callback_reachable(timeout=3)
+    if callback_health.get("reachable"):
+        if callback_health.get("transport") == "ws":
+            results.append(("PASS", "飞书官方长连接已就绪（无需公网地址）"))
+        else:
+            results.append(("PASS", f"飞书公网回调可达: {callback_url}"))
+    else:
+        callback_status = (
+            "FAIL"
+            if os.getenv("PAPER_TRADING_ENABLED", "false").lower() == "true"
+            else "WARN"
+        )
+        results.append((
+            callback_status,
+            f"飞书双向回调不可用: {callback_health.get('reason') or '未知原因'}",
+        ))
+
+    host = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
+    if callback_health.get("transport") == "ws" and callback_health.get("reachable"):
+        results.append(("PASS", "服务可继续仅监听本机；飞书事件由长连接接收"))
+    elif host in {"127.0.0.1", "localhost"} and not callback_url:
+        results.append(("WARN", "服务仅本机监听且没有 PUBLIC_BASE_URL，飞书无法从公网回调到 /api/feishu/callback"))
+    elif host in {"127.0.0.1", "localhost"}:
+        results.append(("WARN", "服务当前仅本机监听；请确认 PUBLIC_BASE_URL 通过反向代理或隧道转发到本机 8080"))
+    else:
+        results.append(("PASS", f"服务监听地址: {host}"))
+
+    if os.getenv("API_KEY"):
+        results.append(("PASS", "API_KEY 已配置（写接口可鉴权开启）"))
+    else:
+        results.append(("WARN", "API_KEY 未配置，写接口会保持关闭"))
+
+    if os.getenv("PAPER_TRADING_ENABLED", "false").lower() == "true":
+        results.append(("WARN", "PAPER_TRADING_ENABLED=true；确认飞书回调和风控验收通过后再实盘运行"))
+    else:
+        results.append(("PASS", "PAPER_TRADING_ENABLED=false（当前仍处于安全关闭状态）"))
     
     # 检查配置文件
     config_files = [
@@ -302,6 +429,8 @@ def daily(mode, dry_run, no_notify, force, date_str):
     if no_notify:
         click.echo("  ℹ️  不推送飞书")
     
+    notification_failed = False
+
     # 执行真实数据流程
     try:
         from src.orchestrator import run_morning_pipeline
@@ -317,18 +446,13 @@ def daily(mode, dry_run, no_notify, force, date_str):
             click.echo(f"  ℹ️  跳过: {result['reason']}")
         elif result["status"] == "exists":
             click.echo("  ℹ️  已有当天报告，返回已有报告")
-        elif result["status"] in ["success", "partial_success"]:
+        elif result["status"] in REPORTABLE_STATUSES:
             click.echo("  ✅ 数据采集完成")
             click.echo(f"  ✅ 报告生成成功")
             
             # 显示数据源状态
             for source, status in result.get("source_status", {}).items():
-                if status in ["ok", "success"]:
-                    icon = "✅"
-                elif status in ["degraded", "fallback"]:
-                    icon = "⚠️"
-                else:
-                    icon = "❌"
+                icon = _source_status_icon(status)
                 click.echo(f"  {icon} {source}: {status}")
             
             # 显示错误
@@ -340,75 +464,24 @@ def daily(mode, dry_run, no_notify, force, date_str):
                 
                 # 推送飞书
                 if not no_notify and result.get("status") != "error":
-                    from src.notifier.feishu import FeishuNotifier
-                    notifier = FeishuNotifier()
-                    if notifier.is_available():
-                        # 根据模式选择报告格式
-                        if mode == "morning":
-                            from src.reporting.formatter import format_morning_report
-                            report_content = format_morning_report(
-                                date_str=date.today().isoformat(),
-                                market_data=result.get("report", {}).get("market_data", {}),
-                                news_list=result.get("report", {}).get("news_sources", []),
-                                sector_recommendations=result.get("report", {}).get("sector_recommendations", []),
-                                stock_recommendations=result.get("report", {}).get("stock_recommendations", []),
-                            )
-                            
-                            # 08:50仅发送只读候选预告，不创建订单、不预扣资金。
-                            candidates = [
-                                s for s in result.get("report", {}).get("stock_recommendations", [])
-                                if s.get("action") == "setup_ready" and s.get("trade_eligible", True)
-                            ]
-                            if candidates:
-                                report_content += "\n\n📌 08:50盘前候选（只读，不执行）\n"
-                                for stock in candidates[:4]:
-                                    report_content += (
-                                        f"  • {stock.get('name', '')}({stock.get('code', '')}) "
-                                        f"参考价¥{stock.get('current_price') or stock.get('entry_price') or 0}\n"
-                                    )
-                                report_content += "09:35将获取当日行情重算，并另发最终交互卡片。"
-                        
-                        else:
-                            # closing模式使用评估报告
-                            evaluation = result.get("evaluation", {})
-                            market_data = result.get("market_data", {})
-                            
-                            report_content = f"🌆 盘后复盘 - {date.today().isoformat()}\n\n"
-                            
-                            # 市场概况
-                            report_content += "📈 今日行情\n"
-                            if "error" not in market_data:
-                                for code, data in market_data.get("indices", {}).items():
-                                    change_pct = data.get("change_pct", 0)
-                                    change_icon = "📈" if change_pct >= 0 else "📉"
-                                    report_content += f"  {change_icon} {data['name']}: {data['close']:.2f} ({change_pct:+.2f}%)\n"
-                            report_content += "\n"
-                            
-                            # 评估结果
-                            quality = evaluation.get("quality", {})
-                            metrics = evaluation.get("metrics", {})
-                            
-                            report_content += "📊 评估结果\n"
-                            report_content += f"  评估状态: {evaluation.get('status', 'unknown')}\n"
-                            report_content += f"  有效样本: {quality.get('valid', 0)}/{quality.get('total', 0)}\n"
-                            report_content += f"  胜率: {metrics.get('win_rate_pct', 0):.1f}%\n"
-                            report_content += f"  平均收益: {metrics.get('avg_return_pct', 0):.2f}%\n"
-                            report_content += "\n"
-                            
-                            # 个股表现
-                            report_content += "📈 个股表现\n"
-                            for stock in evaluation.get("stock_results", []):
-                                status = stock.get("status", "")
-                                status_icon = "✅" if status == "hit" else "❌" if status == "stopped" else "⏳" if status == "active" else "⚠️"
-                                report_content += f"  {status_icon} {stock.get('code')} {stock.get('name')}: {stock.get('return_pct', 0):.2f}%\n"
-                            
-                            report_content += "\n📌 免责声明: 以上为研究信号，不构成买卖建议。"
-                        
-                        notify_result = notifier.send_report(report_content, mode)
-                        if notify_result["status"] == "success":
-                            click.echo("  ✅ 飞书推送成功")
-                        else:
-                            click.echo(f"  ⚠️  飞书推送失败: {notify_result.get('message', '未知错误')}")
+                    report_date = date_str or result.get("report", {}).get("date") or date.today().isoformat()
+                    report_content = _format_report_notification(
+                        report_date,
+                        mode,
+                        result.get("report", {}),
+                        result,
+                    )
+                    notify_result = _deliver_report_notification(
+                        report_date,
+                        mode,
+                        report_content,
+                        source="daily",
+                    )
+                    if notify_result["status"] == "success":
+                        click.echo("  ✅ 飞书推送成功（回执已保存）")
+                    else:
+                        notification_failed = True
+                        click.echo(f"  ❌ 飞书推送失败: {notify_result.get('message') or notify_result.get('reason') or '未知错误'}")
         
     except Exception as e:
         click.echo(f"  ❌ 执行失败: {e}")
@@ -417,7 +490,7 @@ def daily(mode, dry_run, no_notify, force, date_str):
         sys.exit(1)
     
     # 检查结果状态
-    if result.get("status") in ["error", "partial", "partial_success", "degraded"]:
+    if notification_failed or result.get("status") in ["error", "partial"]:
         sys.exit(1)
     
     click.echo("\ndaily 命令执行完成！")
@@ -451,22 +524,90 @@ def init(cash):
 
 @paper.command("open")
 @click.option("--date", "date_str", help="交易日 YYYY-MM-DD")
-def paper_open(date_str):
+@click.option("--if-missing", is_flag=True, help="仅在没有成功状态回执时补跑")
+def paper_open(date_str, if_missing):
     """09:35重新取价，生成并发送最终交易卡片。"""
+    from src.analysis.recovery import recover_degraded_morning_report
+    from src.notifier.feishu import FeishuNotifier
+    from src.notifier.paper_delivery import has_successful_delivery, record_delivery
     from src.paper_trading.workflow import PaperTradingWorkflow
     from src.reporting.report_store import load_report
 
     target = date_str or date.today().isoformat()
+    if if_missing and has_successful_delivery(target):
+        click.echo(f"  ✅ {target} 09:35已有成功状态回执，无需重复执行")
+        return
+
     report = load_report(target, "morning")
     if not report:
+        workflow_result = {"status": "error", "orders": [], "reason": "当天盘前报告缺失"}
+        notifier = FeishuNotifier()
+        notify_result = (
+            notifier.send_message(
+                "09:35模拟交易流程异常",
+                f"{target} 未找到当天盘前报告，未生成任何订单。系统将在09:45自动再检查一次。",
+            )
+            if notifier.is_available()
+            else {"status": "error", "message": "飞书发送配置不可用"}
+        )
+        record_delivery(
+            target,
+            workflow_result,
+            notify_result,
+            source="watchdog" if if_missing else "scheduled",
+        )
         raise click.ClickException(f"未找到 {target} 的盘前报告")
+    recovery = recover_degraded_morning_report(target, report=report)
+    report = recovery.get("report") or report
+    if recovery["status"] == "recovered":
+        click.echo("  ✅ 08:45的LLM降级报告已在09:35自动恢复")
+    elif recovery["status"] == "still_degraded":
+        click.echo("  ⚠️ 09:35补偿分析仍降级，将保持安全模式且不创建订单")
     result = PaperTradingWorkflow().prepare_final_orders(
         report,
         source_status=report.get("source_status", {}),
     )
     click.echo(json.dumps(result, ensure_ascii=False, indent=2))
-    if result.get("status") in {"safe_mode", "disabled"}:
-        raise click.ClickException(result.get("reason", result["status"]))
+    workflow_status = result.get("status", "error")
+    source = "watchdog" if if_missing else "scheduled"
+    if workflow_status == "success":
+        # success只会在交易卡片已经发送成功后返回，避免额外重复消息。
+        notify_result = {"status": "success", "data": {}}
+    else:
+        if workflow_status == "safe_mode":
+            summary = f"今日安全暂停新开仓。\n原因：{result.get('reason') or '风控条件未通过'}"
+        elif workflow_status == "no_orders":
+            rejected = result.get("rejected") if isinstance(result.get("rejected"), list) else []
+            details = "\n".join(
+                f"- {item.get('code') or '未知标的'}：{item.get('reason') or '未通过'}"
+                for item in rejected[:4]
+                if isinstance(item, dict)
+            )
+            summary = "已完成09:35重算，但没有符合¥4,000仓位和风控条件的订单。"
+            if details:
+                summary += f"\n{details}"
+        elif workflow_status == "disabled":
+            summary = "模拟交易当前处于关闭状态，未生成任何订单。"
+        else:
+            summary = f"09:35模拟交易流程未完成：{result.get('reason') or workflow_status}"
+        notifier = FeishuNotifier()
+        notify_result = (
+            notifier.send_message("09:35模拟交易状态", summary)
+            if notifier.is_available()
+            else {"status": "error", "message": "飞书发送配置不可用"}
+        )
+
+    try:
+        record_delivery(target, result, notify_result, source=source)
+    except Exception as exc:
+        raise click.ClickException(f"09:35状态回执保存失败: {exc}") from exc
+
+    if notify_result.get("status") != "success":
+        raise click.ClickException(
+            f"09:35状态未送达飞书: {notify_result.get('message') or notify_result.get('reason') or '未知错误'}"
+        )
+    if workflow_status not in {"success", "safe_mode", "no_orders", "disabled"}:
+        raise click.ClickException(result.get("reason") or workflow_status)
 
 
 @paper.command("execute-due")
@@ -534,35 +675,6 @@ def positions(date_str):
 def plan(date_str):
     """生成交易计划"""
     raise click.ClickException("旧的盘前计划器会写JSON订单，已停用；请在09:35使用 paper open")
-    if not date_str:
-        date_str = date.today().isoformat()
-    
-    from src.paper_trading.planner import Planner
-    from src.reporting.report_store import load_report
-    
-    # 加载当天推荐
-    recommendation = load_report(date_str, "morning")
-    if not recommendation:
-        click.echo(f"  ❌ 未找到 {date_str} 的盘前推荐")
-        return
-    
-    planner = Planner()
-    orders = planner.generate_plan(recommendation, date_str)
-    
-    if not orders:
-        click.echo("  ℹ️  没有生成交易计划")
-        return
-    
-    click.echo(f"\n📌 交易计划 - {date_str}")
-    click.echo("=" * 50)
-    for order in orders:
-        action = "买入" if order.get("action") == "buy" else "卖出"
-        click.echo(f"  {action}: {order.get('name')} {order.get('code')}")
-        click.echo(f"    数量: {order.get('quantity')}股")
-        click.echo(f"    金额: {order.get('estimated_amount', 0):,.0f}")
-        click.echo(f"    理由: {order.get('reason')}")
-        click.echo(f"    订单ID: {order.get('order_id')}")
-        click.echo("")
 
 
 @paper.command()
@@ -615,89 +727,35 @@ def execute(date_str):
 @paper.command()
 @click.option("--date", "date_str", help="日期 (YYYY-MM-DD)")
 def update(date_str):
-    """更新持仓"""
+    """使用 SQLite 唯一账本更新持仓、净值和退出信号。"""
     from src.paper_trading.workflow import PaperTradingWorkflow
     click.echo(json.dumps(PaperTradingWorkflow().intraday_check(), ensure_ascii=False, indent=2))
-    return
-    if not date_str:
-        date_str = date.today().isoformat()
-    
-    from src.paper_trading.portfolio import PaperPortfolio
-    from src.paper_trading.account import PaperAccount
-    from src.data_collectors.market_data import get_stock_data
-    
-    portfolio = PaperPortfolio()
-    account = PaperAccount()
-    
-    positions = portfolio.get_positions(date_str)
-    if not positions:
-        click.echo("  ℹ️  没有持仓需要更新")
-        return
-    
-    click.echo(f"\n🔄 更新持仓 - {date_str}")
-    click.echo("=" * 50)
-    
-    total_market_value = 0
-    for pos in positions:
-        # 获取最新价格
-        stock_data = get_stock_data(pos.get("code"))
-        if "error" not in stock_data:
-            current_price = stock_data.get("close", pos.get("current_price", 0))
-            market_value = current_price * pos.get("quantity", 0)
-            cost_amount = pos.get("avg_cost", 0) * pos.get("quantity", 0)
-            unrealized_pnl_pct = ((current_price - pos.get("avg_cost", 0)) / pos.get("avg_cost", 1) * 100) if pos.get("avg_cost", 0) > 0 else 0
-            
-            portfolio.update_position(pos.get("code"), {
-                "current_price": current_price,
-                "market_value": market_value,
-                "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
-            }, date_str)
-            
-            total_market_value += market_value
-            
-            pnl_icon = "📈" if unrealized_pnl_pct >= 0 else "📉"
-            click.echo(f"  {pnl_icon} {pos.get('name')}: {pos.get('current_price', 0):.2f} → {current_price:.2f} ({unrealized_pnl_pct:+.2f}%)")
-        else:
-            total_market_value += pos.get("market_value", 0)
-            click.echo(f"  ⚠️  {pos.get('name')}: 获取行情失败")
-    
-    # 更新账户
-    account.update_equity(total_market_value, total_market_value - sum(p.get("avg_cost", 0) * p.get("quantity", 0) for p in positions))
-    
-    click.echo("\n更新完成！")
 
 
 @paper.command()
 @click.option("--date", "date_str", help="日期 (YYYY-MM-DD)")
 def performance(date_str):
-    """查看收益"""
+    """查看 SQLite 账本的扣费后收益与最大回撤。"""
     if not date_str:
         date_str = date.today().isoformat()
-    
-    from src.paper_trading.performance import Performance
-    from src.paper_trading.account import PaperAccount
-    from src.paper_trading.portfolio import PaperPortfolio
-    from src.paper_trading.executor import Executor
-    
-    perf = Performance()
-    account = PaperAccount()
-    portfolio = PaperPortfolio()
-    executor = Executor()
-    
-    account_data = account.get_account()
-    positions = portfolio.get_positions(date_str)
-    trades = executor.get_trades(date_str)
-    
-    result = perf.calculate_performance(account_data, positions, trades, date_str)
+
+    from src.paper_trading.trading_service import TradingService
+
+    service = TradingService()
+    result = service.get_performance_metrics()
+    account_data = service.get_account()
+    positions = service.get_positions(date_str)
     
     click.echo(f"\n📊 模拟账户收益 - {date_str}")
     click.echo("=" * 50)
     click.echo(f"  总资产: {result.get('total_equity', 0):,.0f}")
-    click.echo(f"  总收益: {result.get('total_return', 0):,.0f} ({result.get('total_return_pct', 0):.2f}%)")
-    click.echo(f"  未实现盈亏: {result.get('unrealized_pnl', 0):,.0f}")
-    click.echo(f"  已实现盈亏: {result.get('realized_pnl', 0):,.0f}")
-    click.echo(f"  胜率: {result.get('win_rate', 0):.1f}%")
-    click.echo(f"  持仓数量: {result.get('positions_count', 0)}")
+    click.echo(f"  扣费后收益: {result.get('net_return_after_costs', 0):,.2f} ({result.get('net_return_after_costs_pct', 0):.2f}%)")
+    click.echo(f"  最大回撤: {result.get('max_drawdown_pct', 0):.2f}%")
+    click.echo(f"  费用+滑点: {result.get('total_transaction_costs', 0):,.2f}")
+    click.echo(f"  未实现盈亏: {account_data.get('unrealized_pnl', 0):,.2f}")
+    click.echo(f"  已实现盈亏: {account_data.get('realized_pnl', 0):,.2f}")
+    click.echo(f"  已平仓胜率: {result.get('trade_win_rate_pct', 0):.1f}%")
+    click.echo(f"  持仓数量: {len(positions)}")
 
 
 @cli.group()
@@ -917,11 +975,19 @@ def suggestions():
 @cli.command()
 @click.option("--date", "date_str", help="日期 (YYYY-MM-DD)")
 @click.option("--mode", type=click.Choice(["morning", "closing"]), required=True)
-def notify(date_str, mode):
+@click.option("--if-missing", is_flag=True, help="仅在没有成功推送回执时补发")
+def notify(date_str, mode, if_missing):
     """重试飞书推送"""
     if not date_str:
         from datetime import date
         date_str = date.today().isoformat()
+
+    if if_missing:
+        from src.notifier.report_delivery import has_successful_delivery
+
+        if has_successful_delivery(date_str, mode):
+            click.echo(f"  ✅ {date_str} {mode} 已有成功推送回执，无需补发")
+            return
     
     click.echo(f"正在重试飞书推送 {date_str} {mode}...")
     
@@ -930,39 +996,38 @@ def notify(date_str, mode):
     report = load_report(date_str, mode)
     
     if not report:
-        click.echo(f"  ❌ 未找到报告: {date_str}/{mode}")
-        return
-    
-    # 格式化报告
-    from src.reporting.formatter import format_morning_report
-    report_content = format_morning_report(
-        date_str=date_str,
-        market_data=report.get("market_data", {}),
-        news_list=report.get("news_sources", []),
-        sector_recommendations=report.get("sector_recommendations", []),
-        stock_recommendations=report.get("stock_recommendations", []),
+        if if_missing:
+            from src.notifier.feishu import FeishuNotifier
+
+            notifier = FeishuNotifier()
+            if notifier.is_available():
+                notifier.send_message(
+                    "报告生成异常",
+                    f"{date_str} {mode} 报告未生成，漏推补偿无法发送，请检查定时任务日志。",
+                )
+        raise click.ClickException(f"未找到报告: {date_str}/{mode}")
+
+    # 定时推送和手动补发共用格式，避免盘后报告误用盘前模板。
+    report_content = _format_report_notification(date_str, mode, report)
+
+    result = _deliver_report_notification(
+        date_str,
+        mode,
+        report_content,
+        source="watchdog" if if_missing else "manual_retry",
     )
-    
-    # 推送飞书
-    from src.notifier.feishu import FeishuNotifier
-    notifier = FeishuNotifier()
-    
-    if not notifier.is_available():
-        click.echo("  ⚠️  飞书未配置（FEISHU_WEBHOOK_URL）")
-        return
-    
-    result = notifier.send_report(report_content, mode)
     
     if result["status"] == "success":
         click.echo("  ✅ 飞书推送成功")
     else:
-        click.echo(f"  ❌ 飞书推送失败: {result.get('message', '未知错误')}")
+        raise click.ClickException(f"飞书推送失败: {result.get('message') or result.get('reason') or '未知错误'}")
 
 
 @cli.command()
 @click.option("--date", "date_str", help="日期 (YYYY-MM-DD)")
 @click.option("--mode", type=click.Choice(["morning", "closing"]))
-def notify_test(date_str, mode):
+@click.option("--interactive", is_flag=True, help="优先通过飞书自建应用发送测试卡片")
+def notify_test(date_str, mode, interactive):
     """测试飞书推送"""
     if not date_str:
         from datetime import date
@@ -980,9 +1045,16 @@ def notify_test(date_str, mode):
         click.echo("  ⚠️  飞书未配置（FEISHU_WEBHOOK_URL）")
         return
     
-    # 发送测试消息
-    result = notifier.send_message("测试消息", "这是一条来自Stock Intelligence的测试消息")
-    
+    if interactive:
+        missing = notifier.interactive_missing_fields()
+        if missing:
+            click.echo(f"  ⚠️  交互卡片配置不完整，缺少: {', '.join(missing)}")
+            return
+        result = notifier.send_callback_probe()
+    else:
+        # 发送测试消息
+        result = notifier.send_message("测试消息", "这是一条来自Stock Intelligence的测试消息")
+
     if result["status"] == "success":
         click.echo("  ✅ 飞书测试推送成功")
     else:

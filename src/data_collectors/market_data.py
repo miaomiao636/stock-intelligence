@@ -260,6 +260,237 @@ def get_stock_data(stock_code: str) -> Dict:
     return _get_stock_data_eastmoney_direct(stock_code)
 
 
+def _format_trade_date(value) -> str:
+    """将 YYYYMMDD / datetime / date 统一为 YYYY-MM-DD。"""
+    text = str(value or "")[:10]
+    compact = text.replace("-", "")
+    if len(compact) == 8 and compact.isdigit():
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
+    return text
+
+
+def _try_tushare_stock_on(code: str, target_date: str) -> Dict:
+    """只读取指定交易日，禁止用最新行情替代历史行情。"""
+    try:
+        import tushare as ts
+
+        token = os.getenv("TUSHARE_TOKEN")
+        if not token:
+            return {"error": "TUSHARE_TOKEN未配置"}
+        ts.set_token(token)
+        pro = ts.pro_api()
+        suffix = ".SH" if code.startswith("6") else ".BJ" if code.startswith(("8", "4")) else ".SZ"
+        compact = target_date.replace("-", "")
+        df = pro.daily(ts_code=f"{code}{suffix}", start_date=compact, end_date=compact)
+        if df.empty:
+            return {"error": "tushare_target_date_no_data"}
+        row = df.iloc[0]
+        data_date = _format_trade_date(row.get("trade_date", ""))
+        return {
+            "code": code,
+            "date": data_date,
+            "open": float(row.get("open", 0)),
+            "close": float(row.get("close", 0)),
+            "high": float(row.get("high", 0)),
+            "low": float(row.get("low", 0)),
+            "volume": float(row.get("vol", 0)),
+            "amount": float(row.get("amount", 0)),
+            "change_pct": float(row.get("pct_chg", 0)),
+            "_source": "tushare_pro_historical",
+        }
+    except Exception as exc:
+        return {"error": f"tushare_historical_failed: {exc}"}
+
+
+def _try_eastmoney_stock_on(code: str, target_date: str) -> Dict:
+    """东方财富未复权日线的精确日期降级源。"""
+    compact = target_date.replace("-", "")
+    secid = _stock_code_to_secid(code)
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        "fields1=f1,f2,f3,f4,f5,f6&"
+        "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
+        f"klt=101&fqt=0&secid={secid}&beg={compact}&end={compact}"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _NO_PROXY_OPENER.open(req, timeout=8) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        klines = (raw.get("data") or {}).get("klines") or []
+        row = next((line for line in klines if line.startswith(target_date + ",")), None)
+        if not row:
+            return {"error": "eastmoney_target_date_no_data"}
+        parts = row.split(",")
+        return {
+            "code": code,
+            "date": parts[0],
+            "open": float(parts[1]),
+            "close": float(parts[2]),
+            "high": float(parts[3]),
+            "low": float(parts[4]),
+            "volume": float(parts[5]),
+            "amount": float(parts[6]),
+            "change_pct": float(parts[8]) if len(parts) > 8 else 0,
+            "_source": "eastmoney_historical",
+        }
+    except Exception as exc:
+        return {"error": f"eastmoney_historical_failed: {exc}"}
+
+
+def get_stock_data_on(stock_code: str, target_date: str) -> Dict:
+    """获取指定交易日的个股 OHLC；找不到时返回错误，不回退到最新价。"""
+    try:
+        target = date.fromisoformat(target_date)
+    except (TypeError, ValueError):
+        return {"error": "invalid_target_date"}
+    if target > date.today():
+        return {"error": "future_target_date_not_allowed"}
+
+    result = _try_tushare_stock_on(stock_code, target_date)
+    if "error" not in result and result.get("date") == target_date:
+        return result
+
+    if AKSHARE_AVAILABLE:
+        try:
+            compact = target.strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(
+                symbol=stock_code,
+                period="daily",
+                start_date=compact,
+                end_date=compact,
+                adjust="",
+            )
+            if not df.empty:
+                row = df.iloc[-1]
+                data_date = _format_trade_date(row.get("日期", ""))
+                if data_date == target_date:
+                    return {
+                        "code": stock_code,
+                        "date": data_date,
+                        "open": float(row.get("开盘", 0)),
+                        "close": float(row.get("收盘", 0)),
+                        "high": float(row.get("最高", 0)),
+                        "low": float(row.get("最低", 0)),
+                        "volume": float(row.get("成交量", 0)),
+                        "amount": float(row.get("成交额", 0)),
+                        "change_pct": float(row.get("涨跌幅", 0)),
+                        "_source": "akshare_historical",
+                    }
+        except Exception:
+            pass
+
+    return _try_eastmoney_stock_on(stock_code, target_date)
+
+
+def _try_tushare_index_on(index_code: str, target_date: str) -> Dict:
+    try:
+        import tushare as ts
+
+        token = os.getenv("TUSHARE_TOKEN")
+        if not token:
+            return {"error": "TUSHARE_TOKEN未配置"}
+        ts.set_token(token)
+        pro = ts.pro_api()
+        suffix = ".SZ" if index_code.startswith("3") else ".SH"
+        target = date.fromisoformat(target_date)
+        start = (target - timedelta(days=15)).strftime("%Y%m%d")
+        end = target.strftime("%Y%m%d")
+        df = pro.index_daily(ts_code=f"{index_code}{suffix}", start_date=start, end_date=end)
+        if df.empty:
+            return {"error": "tushare_target_index_no_data"}
+        rows = df.sort_values("trade_date", ascending=False).reset_index(drop=True)
+        row = rows.iloc[0]
+        data_date = _format_trade_date(row.get("trade_date", ""))
+        if data_date != target_date:
+            return {"error": "tushare_target_index_date_mismatch"}
+        close = float(row.get("close", 0))
+        prev_close = float(row.get("pre_close", 0))
+        return {
+            "code": index_code,
+            "date": data_date,
+            "close": close,
+            "prev_close": prev_close,
+            "change_pct": float(row.get("pct_chg", 0)),
+            "_source": "tushare_index_historical",
+        }
+    except Exception as exc:
+        return {"error": f"tushare_index_historical_failed: {exc}"}
+
+
+def _try_eastmoney_index_on(index_code: str, target_date: str) -> Dict:
+    target = date.fromisoformat(target_date)
+    start = (target - timedelta(days=15)).strftime("%Y%m%d")
+    end = target.strftime("%Y%m%d")
+    secid = _stock_code_to_secid(index_code)
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        "fields1=f1,f2,f3,f4,f5,f6&"
+        "fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
+        f"klt=101&fqt=0&secid={secid}&beg={start}&end={end}"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _NO_PROXY_OPENER.open(req, timeout=8) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        klines = (raw.get("data") or {}).get("klines") or []
+        rows = [line.split(",") for line in klines]
+        index = next((i for i, row in enumerate(rows) if row[0] == target_date), None)
+        if index is None:
+            return {"error": "eastmoney_target_index_no_data"}
+        row = rows[index]
+        prev_close = float(rows[index - 1][2]) if index > 0 else float(row[2])
+        close = float(row[2])
+        return {
+            "code": index_code,
+            "date": row[0],
+            "close": close,
+            "prev_close": prev_close,
+            "change_pct": round((close - prev_close) / prev_close * 100, 2) if prev_close else 0,
+            "_source": "eastmoney_index_historical",
+        }
+    except Exception as exc:
+        return {"error": f"eastmoney_index_historical_failed: {exc}"}
+
+
+def get_index_data_on(index_code: str, target_date: str) -> Dict:
+    """获取指定交易日指数数据，绝不以实时行情替代。"""
+    try:
+        target = date.fromisoformat(target_date)
+    except (TypeError, ValueError):
+        return {"error": "invalid_target_date"}
+    if target > date.today():
+        return {"error": "future_target_date_not_allowed"}
+    result = _try_tushare_index_on(index_code, target_date)
+    if "error" not in result and result.get("date") == target_date:
+        return result
+
+    if AKSHARE_AVAILABLE:
+        try:
+            symbol = f"sz{index_code}" if index_code.startswith("3") else f"sh{index_code}"
+            df = ak.stock_zh_index_daily(symbol=symbol)
+            if not df.empty:
+                rows = df.copy()
+                rows["_date"] = rows["date"].map(_format_trade_date)
+                rows = rows.sort_values("_date").reset_index(drop=True)
+                matches = rows.index[rows["_date"] == target_date].tolist()
+                if matches:
+                    idx = matches[-1]
+                    row = rows.iloc[idx]
+                    prev_close = float(rows.iloc[idx - 1].get("close", 0)) if idx > 0 else float(row.get("close", 0))
+                    close = float(row.get("close", 0))
+                    return {
+                        "code": index_code,
+                        "date": target_date,
+                        "close": close,
+                        "prev_close": prev_close,
+                        "change_pct": round((close - prev_close) / prev_close * 100, 2) if prev_close else 0,
+                        "_source": "akshare_index_historical",
+                    }
+        except Exception:
+            pass
+    return _try_eastmoney_index_on(index_code, target_date)
+
+
 def _try_tushare_stock(code: str) -> Dict:
     """Tushare Pro 获取个股日线（主数据源）"""
     try:

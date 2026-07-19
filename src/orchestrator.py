@@ -29,6 +29,8 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
     run_id = f"{today}-morning"
     errors = []
     source_status = {}
+    analysis_source = "unknown"
+    llm_diagnostics = []
     
     # 1. 交易日历检查
     target_date = date.fromisoformat(today) if today else date.today()
@@ -141,6 +143,8 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
         sector_recommendations = llm_result["data"].get("sector_recommendations", [])
         stock_recommendations = llm_result["data"].get("stock_recommendations", [])
         source_status["llm"] = llm_result["status"]
+        analysis_source = llm_result.get("source", "unknown")
+        llm_diagnostics = llm_result.get("diagnostics", [])
 
         # 策略调控过滤：价格阈值
         max_price = custom_params.get("max_stock_price", 500)
@@ -163,7 +167,11 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
                     s["track_trigger"] = "策略调控设为短期为主，中长期降级为跟踪"
         
         if llm_result["status"] == "fallback":
-            errors.append("LLM不可用，使用fallback模板")
+            last_error = next(
+                (item.get("error") for item in reversed(llm_diagnostics) if item.get("error")),
+                "未返回具体错误",
+            )
+            errors.append(f"LLM不可用，使用fallback观察模式；最后错误: {last_error}")
 
         from src.strategy.market_regime import get_action_limits
         action_limit = get_action_limits(market_data.get("market_regime", "neutral"))["max_setup_ready"]
@@ -176,12 +184,19 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
                     stock["track_trigger"] = "受当前市场状态的可进场数量上限约束"
         
     except Exception as e:
-        # LLM失败时使用fallback模板
-        from src.analysis.prompts import FALLBACK_TEMPLATE
-        fallback_data = json.loads(FALLBACK_TEMPLATE)
+        # 研判阶段异常时仍走同一套不可交易降级规范，避免字段漂移。
+        fallback_result = Synthesizer()._use_fallback_template(market_data)
+        fallback_data = fallback_result["data"]
         sector_recommendations = fallback_data.get("sector_recommendations", [])
         stock_recommendations = fallback_data.get("stock_recommendations", [])
         source_status["llm"] = "fallback"
+        analysis_source = fallback_result.get("source", "static_template")
+        llm_diagnostics = [{
+            "phase": "orchestration",
+            "attempt": 0,
+            "status": "failed",
+            "error": str(e)[:500],
+        }]
         errors.append(f"LLM调用失败，使用fallback模板: {e}")
     
     # 7. 生成报告
@@ -194,15 +209,20 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
         stock_recommendations=stock_recommendations,
     )
     report["source_status"] = dict(source_status)
+    report["analysis_source"] = analysis_source
+    report["analysis_degraded"] = source_status.get("llm") == "fallback"
+    report["llm_diagnostics"] = llm_diagnostics
 
     # 8. 保存报告（不覆盖已有的好数据）
     if not dry_run:
         # 如果新报告是fallback且已有更好的数据，不覆盖
         if source_status.get("llm") == "fallback" and existing_report:
+            existing_llm = existing_report.get("source_status", {}).get("llm")
             existing_stocks = len(existing_report.get("stock_recommendations", []))
             new_stocks = len(stock_recommendations)
-            if existing_stocks > new_stocks:
+            if existing_llm == "success" or existing_stocks > new_stocks:
                 print(f"  ℹ️  保留已有数据({existing_stocks}只)不覆盖fallback({new_stocks}只)")
+                source_status["report_preserved"] = "existing_llm_success" if existing_llm == "success" else "richer_existing_report"
                 report = existing_report
             else:
                 report_file = save_report(report, "morning")
@@ -237,7 +257,7 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
             print(f"  📊 跟踪: {summary.get('total_tracked', 0)}只, "
                   f"胜率{summary.get('win_rate_pct', 0)}%")
         except Exception as e:
-            source_status["tracking"] = "error"
+            source_status["tracking"] = "degraded"
             errors.append(f"推荐跟踪失败: {e}")
             print(f"  ⚠️  推荐跟踪失败: {e}")
 

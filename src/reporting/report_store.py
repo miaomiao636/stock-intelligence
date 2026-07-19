@@ -3,6 +3,8 @@
 
 import json
 import hashlib
+import shutil
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -29,6 +31,12 @@ def save_report(report: Dict, report_type: str = "morning") -> Path:
         from src.storage.db import get_connection
         conn = get_connection()
         cursor = conn.cursor()
+        run_id = report.get("run_id", "")
+        recommendation_id = report.get("recommendation_id") or f"{run_id}:{report_type}"
+        cursor.execute(
+            "DELETE FROM recommendations WHERE date=? AND type=? AND recommendation_id<>?",
+            (date_str, report_type, recommendation_id),
+        )
 
         # 写入recommendations表
         cursor.execute("""
@@ -37,10 +45,10 @@ def save_report(report: Dict, report_type: str = "morning") -> Path:
              strategy_version, market_regime, sector_data, stock_data, news_data, raw_json, checksum)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            report.get("run_id", ""),
+            recommendation_id,
             date_str,
             report_type,
-            report.get("run_id", ""),
+            run_id,
             report.get("created_at", ""),
             report.get("data_as_of", ""),
             report.get("strategy_version", ""),
@@ -130,6 +138,17 @@ def save_run_artifact(
     """保存运行产物"""
     run_dir = DATA_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # 同一交易日补偿重跑前保留上一版证据，避免09:35覆盖08:45故障现场。
+    artifact_names = ("input_snapshot.json", "source_status.json", "report.json", "errors.log")
+    if (run_dir / "report.json").exists():
+        archive_name = f"{datetime.now().strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:6]}"
+        archive_dir = run_dir / "attempts" / archive_name
+        archive_dir.mkdir(parents=True, exist_ok=False)
+        for name in artifact_names:
+            source = run_dir / name
+            if source.exists():
+                shutil.copy2(source, archive_dir / name)
     
     # 保存输入快照
     with open(run_dir / "input_snapshot.json", "w", encoding="utf-8") as f:

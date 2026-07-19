@@ -106,7 +106,14 @@ def test_pause_day_cancels_all_pending_and_blocks_new_orders(service, open_time)
     for order in (first, second):
         service.mark_final_notified(order["order_id"], notified_at=open_time, veto_minutes=5)
     service.record_decision(first["order_id"], "pause_day", actor="user")
-    assert service.get_order(second["order_id"])["status"] == "paused_for_day"
+    first_order = service.get_order(first["order_id"])
+    second_order = service.get_order(second["order_id"])
+    assert first_order["status"] == "paused_for_day"
+    assert second_order["status"] == "paused_for_day"
+    assert first_order["decision_actor"] == "user"
+    assert second_order["decision_actor"] == "user"
+    assert first_order["decided_at"] is not None
+    assert second_order["decided_at"] is not None
     with pytest.raises(ValueError, match="今日模拟交易已由用户暂停"):
         proposed_buy(service, "000003")
 

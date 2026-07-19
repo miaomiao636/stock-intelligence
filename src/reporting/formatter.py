@@ -84,6 +84,91 @@ def format_morning_report(
     return "\n".join(lines)
 
 
+def format_closing_report(
+    date_str: str,
+    market_data: Dict,
+    evaluation: Dict,
+    warnings: List[str] | None = None,
+) -> str:
+    """格式化盘后报告；辅助数据降级时仍生成可读报告。"""
+    market_data = market_data if isinstance(market_data, dict) else {}
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    warnings = warnings if isinstance(warnings, list) else []
+    lines = [f"🌆 盘后复盘 - {date_str}", ""]
+
+    if evaluation.get("status") == "degraded" or warnings:
+        lines.extend([
+            "⚠️ 数据降级说明",
+            "  部分辅助数据暂不可用，以下有效行情与评估结果仍正常推送。",
+        ])
+        for warning in warnings[:3]:
+            lines.append(f"  · {warning}")
+        lines.append("")
+
+    lines.append("📈 今日行情")
+    indices = market_data.get("indices", {})
+    index_count = 0
+    if "error" not in market_data and isinstance(indices, dict) and indices:
+        for code, data in indices.items():
+            if not isinstance(data, dict):
+                continue
+            index_count += 1
+            name = data.get("name") or code
+            close = data.get("close")
+            change_pct = data.get("change_pct")
+            if isinstance(close, (int, float)):
+                close_text = f"{close:.2f}"
+            else:
+                close_text = "--"
+            if isinstance(change_pct, (int, float)):
+                change_icon = "📈" if change_pct >= 0 else "📉"
+                change_text = f" ({change_pct:+.2f}%)"
+            else:
+                change_icon = "▫️"
+                change_text = ""
+            lines.append(f"  {change_icon} {name}: {close_text}{change_text}")
+    if index_count == 0:
+        lines.append("  市场指数数据暂不可用")
+    lines.append("")
+
+    quality = evaluation.get("quality")
+    quality = quality if isinstance(quality, dict) else {}
+    metrics = evaluation.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    win_rate = metrics.get("win_rate_pct", 0)
+    avg_return = metrics.get("avg_return_pct", 0)
+    win_rate = win_rate if isinstance(win_rate, (int, float)) else 0
+    avg_return = avg_return if isinstance(avg_return, (int, float)) else 0
+    lines.extend([
+        "📊 评估结果",
+        f"  评估状态: {evaluation.get('status', 'unknown')}",
+        f"  有效样本: {quality.get('valid', 0)}/{quality.get('total', 0)}",
+        f"  胜率: {win_rate:.1f}%",
+        f"  平均收益: {avg_return:.2f}%",
+        "",
+        "📈 个股表现",
+    ])
+
+    stock_results = evaluation.get("stock_results", [])
+    stock_results = stock_results if isinstance(stock_results, list) else []
+    stock_count = 0
+    if stock_results:
+        for stock in stock_results:
+            if not isinstance(stock, dict):
+                continue
+            stock_count += 1
+            status = stock.get("status", "")
+            status_icon = "✅" if status == "hit" else "❌" if status == "stopped" else "⏳" if status == "active" else "⚠️"
+            return_pct = stock.get("return_pct", 0)
+            return_text = f"{return_pct:.2f}%" if isinstance(return_pct, (int, float)) else "--"
+            lines.append(f"  {status_icon} {stock.get('code', '')} {stock.get('name', '')}: {return_text}")
+    if stock_count == 0:
+        lines.append("  暂无可评估个股")
+
+    lines.extend(["", "📌 免责声明: 以上为研究信号，不构成买卖建议。"])
+    return "\n".join(lines)
+
+
 def format_json_report(
     date_str: str,
     report_type: str,

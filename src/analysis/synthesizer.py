@@ -2,6 +2,9 @@
 """综合研判模块"""
 
 import json
+import hashlib
+import os
+import time
 from typing import Dict, List, Optional
 
 from src.analysis.llm_client import LLMClient
@@ -14,7 +17,9 @@ class Synthesizer:
 
     def __init__(self):
         self.llm_client = LLMClient()
-        self.max_retries = 2  # 降为2次：每次最多120s，2次=240s+退避，避免总超时
+        self.max_retries = max(1, min(3, int(os.getenv("LLM_ANALYSIS_RETRIES", "2"))))
+        self.format_retries = max(0, min(2, int(os.getenv("LLM_FORMAT_RETRIES", "1"))))
+        self.repair_timeout = max(10, min(90, int(os.getenv("LLM_REPAIR_TIMEOUT", "45"))))
     
     def analyze(
         self,
@@ -53,6 +58,12 @@ class Synthesizer:
             result = self._try_llm_analysis(prompt, market_data)
         else:
             result = self._use_fallback_template(market_data)
+            result["diagnostics"] = [{
+                "phase": "availability",
+                "attempt": 0,
+                "status": "failed",
+                "error": "LLM客户端未初始化，请检查LLM_API_KEY配置",
+            }]
 
         # 添加数据质量信息到结果
         result["data_quality"] = data_quality
@@ -61,47 +72,127 @@ class Synthesizer:
         return result
     
     def _try_llm_analysis(self, prompt: str, market_data: Dict = None) -> Dict:
-        """尝试LLM分析（C5: 重试间加指数退避）"""
-        import time
+        """分离网络重试与格式修复；失败时只返回不可交易观察数据。"""
+        diagnostics = []
 
         for attempt in range(self.max_retries):
             try:
-                # 调用LLM
                 raw_output = self.llm_client.chat(
                     messages=[
-                        {"role": "system", "content": "你是一个专业的股票分析师，只输出JSON格式的分析报告。"},
+                        {"role": "system", "content": "你是专业A股分析师。只输出一个严格JSON对象，不要Markdown代码块或额外说明。"},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,
+                    json_mode=True,
                 )
-
-                # 校验输出
-                is_valid, data, error = validate_llm_output(raw_output)
-
-                if is_valid:
-                    # 应用action规则
-                    data = apply_action_rules(data)
-                    return {
-                        "status": "success",
-                        "data": data,
-                        "source": "llm",
-                        "attempt": attempt + 1,
-                    }
-                else:
-                    print(f"  ⚠️  LLM输出校验失败 (尝试 {attempt + 1}/{self.max_retries}): {error}")
-                    if attempt < self.max_retries - 1:
-                        time.sleep(2 ** attempt)  # C5: 指数退避 1s, 2s...
-                    continue
-
             except Exception as e:
+                diagnostics.append(self._diagnostic(
+                    "analysis_request", attempt + 1, str(e)
+                ))
                 print(f"  ⚠️  LLM调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)  # C5: 指数退避
+                    time.sleep(2 ** attempt)
                 continue
 
-        # 所有重试都失败，使用fallback（传入market_data生成可交易推荐）
+            is_valid, data, error = validate_llm_output(raw_output)
+            if is_valid:
+                return {
+                    "status": "success",
+                    "data": apply_action_rules(data),
+                    "source": "llm",
+                    "attempt": attempt + 1,
+                    "diagnostics": diagnostics,
+                }
+
+            diagnostics.append(self._diagnostic(
+                "analysis_validation", attempt + 1, error, raw_output
+            ))
+            print(f"  ⚠️  LLM输出校验失败 (尝试 {attempt + 1}/{self.max_retries}): {error}")
+
+            # 已有完整分析内容时，只让模型修复格式，不重复整段市场研判。
+            repair_input = raw_output
+            repair_error = error
+            for repair_attempt in range(self.format_retries):
+                try:
+                    repaired_output = self.llm_client.chat(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "你是JSON格式修复器。只修复语法和字段格式，保留原有分析含义；只输出严格JSON对象。",
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"校验错误：{repair_error}\n"
+                                    "请修复下面内容，不要补充不存在的事实：\n"
+                                    f"{repair_input}"
+                                ),
+                            },
+                        ],
+                        temperature=0,
+                        timeout=self.repair_timeout,
+                        json_mode=True,
+                    )
+                except Exception as e:
+                    diagnostics.append(self._diagnostic(
+                        "format_repair", attempt + 1, str(e),
+                        repair_attempt=repair_attempt + 1,
+                    ))
+                    print(f"  ⚠️  LLM格式修复失败: {e}")
+                    break
+
+                repaired_valid, repaired_data, repair_error = validate_llm_output(repaired_output)
+                diagnostics.append(self._diagnostic(
+                    "format_repair",
+                    attempt + 1,
+                    "" if repaired_valid else repair_error,
+                    repaired_output,
+                    repair_attempt + 1,
+                    status="success" if repaired_valid else "failed",
+                ))
+                if repaired_valid:
+                    return {
+                        "status": "success",
+                        "data": apply_action_rules(repaired_data),
+                        "source": "llm_repaired",
+                        "attempt": attempt + 1,
+                        "repair_attempt": repair_attempt + 1,
+                        "diagnostics": diagnostics,
+                    }
+                repair_input = repaired_output
+
+            if attempt < self.max_retries - 1:
+                time.sleep(2 ** attempt)
+
         print("  ⚠️  LLM所有重试都失败，使用fallback模板")
-        return self._use_fallback_template(market_data)
+        fallback = self._use_fallback_template(market_data)
+        fallback["attempt"] = self.max_retries
+        fallback["diagnostics"] = diagnostics
+        return fallback
+
+    @staticmethod
+    def _diagnostic(
+        phase: str,
+        attempt: int,
+        error: str,
+        raw_output: str = None,
+        repair_attempt: int = None,
+        status: str = "failed",
+    ) -> Dict:
+        """记录可排障元数据，不持久化可能含敏感信息的原始响应。"""
+        item = {
+            "phase": phase,
+            "attempt": attempt,
+            "status": status,
+            "error": str(error or "")[:500],
+        }
+        if repair_attempt is not None:
+            item["repair_attempt"] = repair_attempt
+        if raw_output is not None:
+            encoded = str(raw_output).encode("utf-8", errors="replace")
+            item["response_chars"] = len(str(raw_output))
+            item["response_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return item
     
     def _use_fallback_template(self, market_data: Dict = None) -> Dict:
         """使用fallback模板——优先用实时行情生成可交易推荐"""
@@ -118,12 +209,25 @@ class Synthesizer:
                 }
 
         # 最终兜底：静态模板（不可交易，仅展示）
-        data = json.loads(FALLBACK_TEMPLATE)
-        data = apply_action_rules(data)
+        data = apply_action_rules(json.loads(FALLBACK_TEMPLATE))
+        for sector in data.get("sector_recommendations", []):
+            sector.update({
+                "rating": 0,
+                "target_return_pct": 0.0,
+                "risk_level": "unassessed",
+                "reason": "LLM降级，当前仅展示观察板块，不构成板块推荐。",
+                "degraded": True,
+                "source": "static_fallback",
+            })
         for stock in data.get("stock_recommendations", []):
             stock["action"] = "watch"
             stock["trade_eligible"] = False
             stock["degraded_reason"] = "fallback数据禁止自动交易"
+            stock["entry_price"] = None
+            stock["target_price"] = None
+            stock["stop_loss_price"] = None
+            stock["target_return_pct"] = None
+            stock["stop_loss_pct"] = None
 
         return {
             "status": "fallback",
@@ -172,13 +276,6 @@ class Synthesizer:
             price = float(s.get("price", 0))
             change = float(s.get("change_pct", 0))
 
-            # 保守的止盈止损
-            target_pct = 3.0
-            stop_pct = -3.0
-            entry_price = price
-            target_price = round(price * (1 + target_pct / 100), 2)
-            stop_price = round(price * (1 + stop_pct / 100), 2)
-
             stocks.append({
                 "code": code,
                 "name": name,
@@ -189,29 +286,32 @@ class Synthesizer:
                 "horizon": "short",
                 "horizon_days": 3,
                 "current_price": price,
-                "entry_price": entry_price,
-                "target_price": target_price,
-                "stop_loss_price": stop_price,
-                "target_return_pct": target_pct,
-                "stop_loss_pct": stop_pct,
+                "entry_price": None,
+                "target_price": None,
+                "stop_loss_price": None,
+                "target_return_pct": None,
+                "stop_loss_pct": None,
                 "reason": f"LLM不可用，仅观察。当前{price}元，涨跌{change}%；fallback禁止自动交易。",
                 "reason_news": "LLM不可用，无新闻分析",
                 "reason_policy": "LLM不可用，无政策分析",
                 "reason_technical": f"实时价格{price}元，涨跌幅{change}%",
                 "reason_fund": "LLM不可用，无资金面分析",
                 "timing": {
-                    "entry_condition": "当前价格可买入",
-                    "entry_price_range": f"{price * 0.995:.2f}-{price * 1.005:.2f}",
-                    "entry_rule": "trigger_price",
-                    "entry_price": entry_price,
-                    "risk_exit_condition": f"止损{stop_pct}%",
-                    "target_observation_price": target_price,
-                    "stop_loss_price": stop_price,
+                    "entry_condition": "仅观察，不生成进场条件",
+                    "entry_price_range": None,
+                    "entry_rule": "observe_only",
+                    "entry_price": None,
+                    "risk_exit_condition": "LLM恢复后重新评估",
+                    "target_observation_price": None,
+                    "stop_loss_price": None,
                 },
                 "entry_date": None,
                 "expiry_date": None,
                 "incremental_basis": "实时行情fallback",
                 "track_trigger": "",
+                "degraded": True,
+                "degraded_reason": "LLM降级，仅展示实时行情观察项",
+                "source": "realtime_fallback",
             })
 
         if not stocks:
@@ -220,9 +320,22 @@ class Synthesizer:
         # 构建板块推荐
         sectors = {}
         for s in stocks:
-            sec = s.get("sector", "其他")
+            sec = s.get("sector") or "其他"
             if sec not in sectors:
-                sectors[sec] = {"name": sec, "allocation": 0.3, "reason": "fallback推荐"}
+                sectors[sec] = {
+                    "sector_name": sec,
+                    "rating": 0,
+                    "reason": "LLM降级，仅按观察股票所属行业聚合，不构成板块推荐。",
+                    "horizon": "short",
+                    "horizon_days": 0,
+                    "target_return_pct": 0.0,
+                    "risk_level": "unassessed",
+                    "entry_date": None,
+                    "expiry_date": None,
+                    "incremental_basis": "实时行情观察名单聚合",
+                    "degraded": True,
+                    "source": "realtime_fallback",
+                }
 
         return {
             "date": market_data.get("date", ""),
@@ -233,8 +346,8 @@ class Synthesizer:
             "sector_recommendations": list(sectors.values()),
             "stock_recommendations": stocks,
             "risk_warnings": [
-                "⚠️ LLM不可用，推荐基于实时行情自动生成",
-                "⚠️ 采用保守止盈止损策略",
+                "⚠️ LLM不可用，以下仅为实时行情观察名单",
+                "⚠️ 降级结果不提供进场价、目标价或止损价",
                 "⚠️ 建议LLM恢复后重新评估",
             ],
             "news_sources": [],

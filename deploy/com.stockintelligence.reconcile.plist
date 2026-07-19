@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stockintelligence.reconcile</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Admin/github-ai-tools/stock-intelligence/.venv/bin/python</string>
+        <string>/Users/Admin/github-ai-tools/stock-intelligence/cli.py</string>
+        <string>reconcile</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/Admin/github-ai-tools/stock-intelligence</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/Admin/github-ai-tools/stock-intelligence/data/logs/reconcile.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Admin/github-ai-tools/stock-intelligence/data/logs/reconcile.err.log</string>
+</dict>
+</plist>

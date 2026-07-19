@@ -42,6 +42,9 @@ class TradingService:
     def get_account(self) -> Dict:
         return self.ledger.get_account()
 
+    def update_available_cash(self, cash: float) -> Dict:
+        return self.ledger.update_available_cash(cash)
+
     def get_positions(self, as_of_date: str = None):
         return self.ledger.positions(as_of_date or self.now().date().isoformat())
 
@@ -140,7 +143,7 @@ class TradingService:
         if not self.ledger.record_decision(order_id, decision, actor, now, event_id):
             return self.get_order(order_id)
         if decision == "pause_day":
-            self.ledger.pause_day(now.date().isoformat(), now)
+            self.ledger.pause_day(now.date().isoformat(), now, actor)
             return self.get_order(order_id)
         return self.ledger.update_order(
             order_id,
@@ -347,20 +350,76 @@ class TradingService:
     def get_performance_metrics(self) -> Dict:
         account = self.get_account()
         snapshots = self.ledger.snapshots()
-        values = [float(s["total_equity"]) for s in snapshots]
+        cash_adjustments = self.ledger.cash_adjustments()
+        live_equity = float(account["total_equity"])
+        current = live_equity
+        current_at = account["updated_at"]
+        account_updated_at = datetime.fromisoformat(account["updated_at"])
+        latest_snapshot_at = None
+        if snapshots:
+            latest_snapshot_at = datetime.fromisoformat(snapshots[-1]["captured_at"])
+            if (account_updated_at.tzinfo is None) != (latest_snapshot_at.tzinfo is None):
+                account_updated_at = account_updated_at.replace(tzinfo=None)
+                latest_snapshot_at = latest_snapshot_at.replace(tzinfo=None)
+            # 空仓账户的净值变化只能来自显式快照；初始化时间不能把当天
+            # 较早写入的收盘快照错误覆盖为初始资金。若账户/持仓确有变化，
+            # 再用更新时间选择账户实时值或更新的快照。
+            account_has_live_change = any((
+                abs(live_equity - float(account["initial_cash"])) > 1e-9,
+                abs(float(account.get("cash") or 0) - float(account["initial_cash"])) > 1e-9,
+                abs(float(account.get("market_value") or 0)) > 1e-9,
+                abs(float(account.get("realized_pnl") or 0)) > 1e-9,
+            ))
+            if not account_has_live_change or latest_snapshot_at > account_updated_at:
+                current = float(snapshots[-1]["total_equity"])
+                current_at = snapshots[-1]["captured_at"]
+
+        def principal_at(captured_at: str) -> float:
+            adjustment = sum(
+                float(item["amount"])
+                for item in cash_adjustments
+                if item["created_at"] <= captured_at
+            )
+            return float(account["initial_cash"]) + adjustment
+
+        current_principal = principal_at(current_at)
+        # 以资金流调整后的净值指数计算回撤，充值/取现不会被误算为盈亏。
+        values = [1.0]
+        values.extend(
+            float(snapshot["total_equity"]) / principal_at(snapshot["captured_at"])
+            for snapshot in snapshots
+        )
+        if not snapshots or current == live_equity:
+            values.append(current / current_principal)
         max_drawdown = 0.0
-        peak = values[0] if values else account["initial_cash"]
+        peak = 1.0
         for value in values:
             peak = max(peak, value)
             if peak > 0:
                 max_drawdown = max(max_drawdown, (peak - value) / peak * 100)
-        current = values[-1] if values else account["total_equity"]
+        trades = self.ledger.list_trades(limit=1000)
+        total_fees = round(sum(float(t.get("fees") or 0) for t in trades), 2)
+        total_slippage = round(sum(float(t.get("slippage") or 0) for t in trades), 2)
+        closed_trades = [t for t in trades if t.get("action") == "sell" and t.get("realized_pnl") is not None]
+        winning_trades = sum(1 for t in closed_trades if float(t["realized_pnl"]) > 0)
+        net_return = round(current - current_principal, 2)
+        net_return_pct = round((current / current_principal - 1) * 100, 4)
         return {
             "initial_cash": account["initial_cash"],
+            "capital_adjustment": account["net_cash_adjustment"],
+            "effective_principal": round(current_principal, 2),
             "total_equity": current,
-            "net_return": round(current - account["initial_cash"], 2),
-            "net_return_pct": round((current / account["initial_cash"] - 1) * 100, 4),
+            "net_return": net_return,
+            "net_return_pct": net_return_pct,
+            "net_return_after_costs": net_return,
+            "net_return_after_costs_pct": net_return_pct,
             "max_drawdown_pct": round(max_drawdown, 4),
+            "total_fees": total_fees,
+            "total_slippage": total_slippage,
+            "total_transaction_costs": round(total_fees + total_slippage, 2),
+            "closed_trades": len(closed_trades),
+            "trade_win_rate_pct": round(winning_trades / len(closed_trades) * 100, 2) if closed_trades else 0,
+            "cost_basis": "fees_and_slippage_included",
         }
 
     def get_risk_state(self, trade_date: str = None) -> Dict:

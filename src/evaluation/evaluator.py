@@ -6,7 +6,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from src.data_collectors.market_data import get_stock_data, get_index_data
+from src.data_collectors.market_data import get_stock_data_on, get_index_data_on
 from src.evaluation.metrics import calculate_return, calculate_metrics
 from src.evaluation.leak_guard import validate_no_future_data
 
@@ -16,6 +16,15 @@ class Evaluator:
     
     def __init__(self):
         self.data_dir = Path(__file__).parent.parent.parent / "data"
+
+    @staticmethod
+    def _is_actionable(stock: Dict) -> bool:
+        """Return whether a recommendation was eligible to enter."""
+        action = str(stock.get("action") or "").strip().lower()
+        return (
+            action in {"", "setup_ready", "buy"}
+            and stock.get("trade_eligible", True) is not False
+        )
     
     def evaluate_recommendation(
         self,
@@ -28,8 +37,10 @@ class Evaluator:
             target_date = date.today().isoformat()
         
         stock_results = []
-        
-        for stock in recommendation.get("stock_recommendations", []):
+        all_stocks = recommendation.get("stock_recommendations", [])
+        actionable_stocks = [stock for stock in all_stocks if self._is_actionable(stock)]
+
+        for stock in actionable_stocks:
             result = self._evaluate_stock(stock, target_date)
             stock_results.append(result)
         
@@ -41,56 +52,72 @@ class Evaluator:
         error_count = len(error_results)
         error_rate = error_count / total if total > 0 else 0
         
-        # 确定评估状态
-        if valid_count < 3:
+        # 小资金账户可能只产生1-2条高质量推荐，门槛不能高于当天实际推荐数。
+        min_valid_required = min(3, total) if total > 0 else 1
+        if valid_count < min_valid_required:
             eval_status = "error"
         elif error_rate > 0.2:
             eval_status = "degraded"
         else:
             eval_status = "success"
         
-        # 计算基准收益（使用沪深300指数）
-        benchmark_data = get_index_data("000300")  # 沪深300指数
-        benchmark_return = benchmark_data.get("change_pct", 0)
+        # 计算目标交易日基准收益（使用沪深300指数）。历史评估不得回退到最新行情。
+        benchmark_data = get_index_data_on("000300", target_date)
+        benchmark_error = benchmark_data.get("error")
+        benchmark_return = benchmark_data.get("change_pct", 0) if not benchmark_error else 0
+        if benchmark_error and eval_status == "success":
+            eval_status = "degraded"
         
         # 计算综合指标（只使用有效样本）
         metrics = calculate_metrics(valid_results, benchmark_return)
         
-        return {
+        evaluation = {
             "date": target_date,
             "recommendation_date": recommendation.get("date"),
             "recommendation_type": recommendation.get("type"),
             "status": eval_status,
             "quality": {
                 "total": total,
+                "source_total": len(all_stocks),
+                "excluded_non_actionable": len(all_stocks) - total,
                 "valid": valid_count,
                 "error": error_count,
                 "error_rate": round(error_rate, 2),
-                "min_valid_required": 3,
+                "min_valid_required": min_valid_required,
             },
             "stock_results": stock_results,
             "metrics": metrics,
             "benchmark_return_pct": benchmark_return,
+            "benchmark_data_date": benchmark_data.get("date", ""),
+            "benchmark_status": "error" if benchmark_error else "ok",
+            "benchmark_error": benchmark_error,
             "evaluated_at": datetime.now().isoformat(),
         }
+
+        leak_guard = validate_no_future_data(recommendation, evaluation)
+        evaluation["leak_guard"] = leak_guard
+        if not leak_guard["valid"]:
+            evaluation["status"] = "error"
+        return evaluation
     
     def _evaluate_stock(self, stock: Dict, target_date: str) -> Dict:
-        """评估单只股票
-
-        注意：当前实现使用最新数据，而非target_date的历史数据
-        这是一个已知限制，将在后续版本中修复
-
-        TODO: 实现按target_date获取历史OHLC数据
-        """
+        """使用 target_date 的收盘数据评估单只股票。"""
 
         code = stock.get("code", "")
         name = stock.get("name", "")
-        entry_price = stock.get("timing", {}).get("entry_price")
-        target_return = stock.get("target_return_pct", 0)
-        stop_loss = stock.get("stop_loss_pct", -3.0)
+        entry_price = stock.get("entry_price") or stock.get("timing", {}).get("entry_price")
+        try:
+            target_return = float(stock.get("target_return_pct") or 0)
+        except (TypeError, ValueError):
+            target_return = 0.0
+        try:
+            stop_loss = float(stock.get("stop_loss_pct") or -3.0)
+        except (TypeError, ValueError):
+            stop_loss = -3.0
+        if stop_loss > 0:
+            stop_loss = -stop_loss
 
-        # 获取当前行情（注意：这里使用最新数据，不是target_date的数据）
-        current_data = get_stock_data(code)
+        current_data = get_stock_data_on(code, target_date)
 
         if "error" in current_data:
             return {
@@ -98,7 +125,9 @@ class Evaluator:
                 "name": name,
                 "status": "error",
                 "reason": current_data["error"],
-                "evaluation_note": "数据获取失败",
+                "data_date": current_data.get("date", ""),
+                "target_date": target_date,
+                "evaluation_note": "目标交易日数据获取失败，已拒绝用最新价替代",
             }
 
         current_price = current_data.get("close", 0)
@@ -130,7 +159,7 @@ class Evaluator:
         else:
             status = "active"
 
-        # 检查数据日期是否匹配目标日期
+        # 日期不匹配由 leak_guard 统一失败关闭。
         date_mismatch = data_date != target_date if data_date else True
 
         return {
@@ -150,7 +179,7 @@ class Evaluator:
             "data_date": data_date,
             "target_date": target_date,
             "date_mismatch": date_mismatch,
-            "evaluation_note": "使用最新数据评估（非目标日期）" if date_mismatch else "按目标日期评估",
+            "evaluation_note": "数据日期与目标日期不一致" if date_mismatch else "按目标日期评估",
         }
     
     def save_evaluation(self, evaluation: Dict) -> Path:
@@ -169,6 +198,14 @@ class Evaluator:
             from src.storage.db import get_connection
             conn = get_connection()
             cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM evaluations WHERE date=? AND recommendation_date=? AND recommendation_type=?",
+                (
+                    date_str,
+                    evaluation.get("recommendation_date", ""),
+                    evaluation.get("recommendation_type", ""),
+                ),
+            )
             
             cursor.execute("""
                 INSERT OR REPLACE INTO evaluations 

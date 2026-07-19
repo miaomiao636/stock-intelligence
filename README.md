@@ -32,23 +32,31 @@ python -m pytest -q -m integration
 
 ## 飞书双向配置
 
-普通群机器人Webhook只能发送报告。交易卡片必须配置飞书自建应用，并在 `.env` 设置：
+普通群机器人Webhook只能发送报告。交易卡片必须配置飞书自建应用。系统默认优先使用官方长连接，因此本机使用时不需要购买域名或维持公网隧道：
 
 ```dotenv
+HOST=127.0.0.1
+PUBLIC_BASE_URL=
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=...
 FEISHU_RECEIVE_ID=...
 FEISHU_RECEIVE_ID_TYPE=chat_id
 FEISHU_VERIFICATION_TOKEN=...
+FEISHU_CALLBACK_MODE=auto
+FEISHU_HTTP_FALLBACK_ENABLED=false
 API_KEY=一段足够长的随机值
 PAPER_TRADING_ENABLED=false
 ```
 
-把飞书卡片回调指向：
+在飞书开发者后台把“事件与回调”的订阅方式切换为“使用长连接接收事件”，保存并发布版本。长连接由 `deploy/com.stockintelligence.feishu-ws.plist` 开机启动，健康状态写入 `data/runtime/feishu_ws_status.json`。
+
+若以后需要 HTTP 备用模式，可把飞书卡片回调指向：
 
 ```text
 POST https://你的可访问地址/api/feishu/callback
 ```
+
+只有使用 HTTP 备用模式时，`PUBLIC_BASE_URL` 才必须是飞书能访问到的公网 HTTPS 地址。
 
 先保持 `PAPER_TRADING_ENABLED=false`。完成卡片发送、回调、重复点击、迟到回调、服务重启和跳价拒绝测试后，才改为 `true`。
 
@@ -58,12 +66,16 @@ POST https://你的可访问地址/api/feishu/callback
 |---|---|
 | 08:45 | 收集行情、新闻和政策，生成盘前报告，不创建成交 |
 | 08:50左右 | 飞书发送只读候选预告 |
+| 08:55 | 检查推送成功回执，缺失时自动补发或发送异常提示 |
 | 09:35 | 重新获取当日行情，生成最终订单并发送交互卡片 |
+| 09:45 | 检查09:35状态回执；中断、漏报或通知失败时自动补跑 |
 | 确认后/5分钟到期 | 再次取价、原子抢单、风控和模拟撮合 |
 | 盘中每30分钟 | 盯市、权益快照、止损/目标/持有周期检查；仅变化时推送 |
 | 16:45 | 盘后评估、净收益与回撤记录、策略观察 |
+| 16:55 | 检查盘后推送回执，缺失时自动补发 |
 
 定时任务模板位于 `deploy/stock-intelligence.cron`。其中每分钟任务只扫描已确认或已到期订单；无待执行订单时不请求行情、不发送消息。
+`deploy/com.stockintelligence.reconcile.plist` 每5分钟做一次只读回执检查；如果电脑睡眠错过了 `cron`，唤醒后只补跑仍在安全时窗内且没有成功回执的阶段。09:35开仓补偿最晚只到10:05，避免迟到追单；盘后报告可在当天唤醒后补齐。
 
 ## 常用命令
 
@@ -72,9 +84,11 @@ POST https://你的可访问地址/api/feishu/callback
 python cli.py daily --mode morning
 python cli.py daily --mode closing
 python cli.py daily --mode morning --dry-run --no-notify --force
+python cli.py notify --mode closing --if-missing
 
 # 安全模拟交易
 python cli.py paper open
+python cli.py paper open --if-missing
 python cli.py paper execute-due
 python cli.py paper intraday
 python cli.py paper account
@@ -84,7 +98,10 @@ python cli.py paper orders --status final_notified
 # 环境与通知
 python cli.py doctor
 python cli.py notify-test
+python cli.py notify-test --interactive
 ```
+
+`notify-test --interactive` 现在会发送一个只用于回调自检的安全卡片。点击“验证回调”按钮只返回成功提示，不会创建订单，也不会触发成交。
 
 旧的 `paper execute`、旧AutoTrader和 `/api/paper/execute` 已停用，不能绕过飞书窗口和重新取价。
 
@@ -109,4 +126,3 @@ tests/                                单元、API和联网集成测试
 3. `.env` 中的飞书双向参数和 `API_KEY` 已配置，密钥未提交。
 4. 飞书三个按钮、五分钟超时、重复执行、T+1、跳价和回调失败测试通过。
 5. 先运行至少20个交易日shadow mode，再开启长期模拟交易。
-

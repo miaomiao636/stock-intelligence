@@ -19,9 +19,13 @@ DIR=/Users/Admin/github-ai-tools/stock-intelligence
 
 # 盘前推荐（周一至周五 08:45）
 45 8 * * 1-5 cd $DIR && $PY cli.py daily --mode morning >> /tmp/stock-intelligence-morning.log 2>&1
+# 08:55检查成功回执；首次推送失败或进程中断时自动补发。
+55 8 * * 1-5 cd $DIR && $PY cli.py notify --mode morning --if-missing >> /tmp/stock-intelligence-notify-watchdog.log 2>&1
 
 # 09:35重新取价并发送最终计划；09:40执行无否决且仍通过风控的订单
 35 9 * * 1-5 cd $DIR && $PY cli.py paper open >> /tmp/stock-intelligence-open.log 2>&1
+# 09:45检查阶段回执；09:35中断或状态消息未送达时自动补跑一次。
+45 9 * * 1-5 cd $DIR && $PY cli.py paper open --if-missing >> /tmp/stock-intelligence-open-watchdog.log 2>&1
 # 仅扫描待执行订单；没有到期/已确认订单时不请求行情、不发消息。
 * 9-14 * * 1-5 cd $DIR && $PY cli.py paper execute-due >> /tmp/stock-intelligence-execute.log 2>&1
 0 15 * * 1-5 cd $DIR && $PY cli.py paper execute-due >> /tmp/stock-intelligence-execute.log 2>&1
@@ -34,3 +38,5 @@ DIR=/Users/Admin/github-ai-tools/stock-intelligence
 
 # 盘后评估（周一至周五 16:45）
 45 16 * * 1-5 cd $DIR && $PY cli.py daily --mode closing >> /tmp/stock-intelligence-closing.log 2>&1
+# 16:55检查成功回执；降级报告也必须有明确推送结果。
+55 16 * * 1-5 cd $DIR && $PY cli.py notify --mode closing --if-missing >> /tmp/stock-intelligence-notify-watchdog.log 2>&1

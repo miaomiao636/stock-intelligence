@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import os
+import logging
+import threading
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -17,8 +19,10 @@ from pydantic import BaseModel
 from src.models import ApiResponse
 
 app = FastAPI(title="Stock Intelligence Dashboard")
+logger = logging.getLogger("stock_intelligence.feishu")
+ANALYSIS_REGEN_LOCK = threading.Lock()
 
-# API Key 鉴权：写接口未配置时安全关闭；配置后只接受 X-API-Key 请求头。
+# API Key 鉴权：读取接口可直接看盘；所有会改变状态的接口仍只接受 X-API-Key。
 API_KEY = os.getenv("API_KEY", "")
 
 # 飞书回调用Verification Token独立鉴权。
@@ -29,9 +33,10 @@ async def auth_middleware(request: Request, call_next):
     callback_path = "/api/feishu/callback"
     if request.url.path == callback_path:
         return await call_next(request)
-    if request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH", "DELETE"} and not API_KEY:
+    is_write = request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+    if is_write and not API_KEY:
         return JSONResponse(status_code=503, content=ApiResponse.fail("写接口已安全关闭：请先配置 API_KEY"))
-    if API_KEY and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+    if is_write and API_KEY:
         provided = request.headers.get("X-API-Key")
         if provided != API_KEY:
             return JSONResponse(status_code=401, content=ApiResponse.fail("未授权：API Key 无效或缺失"))
@@ -82,7 +87,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 
 # API模型
 class AccountUpdate(BaseModel):
-    initial_cash: float
+    cash: float
 
 
 class PaperTrade(BaseModel):
@@ -130,10 +135,12 @@ async def get_account():
     return TradingService().get_account()
 
 
-# API: 更新账户（安全版本）
+# API: 修改可用现金（不重置持仓、订单或历史记录）
 @app.put("/api/account")
 async def update_account(data: AccountUpdate):
-    return ApiResponse.fail("初始资金已锁定为¥4,000；如需重建账户请使用带确认参数的reset接口")
+    from src.paper_trading.trading_service import TradingService
+    account = TradingService().update_available_cash(data.cash)
+    return {"success": True, "account": account}
 
 
 # API: 重置账户（危险操作）
@@ -184,6 +191,25 @@ async def get_recommendation(date_str: Optional[str] = None):
         return ApiResponse.fail("No recommendation found")
     _enrich_stock_prices(report)
     return report
+
+
+@app.post("/api/recommendation/regenerate")
+def regenerate_morning_analysis():
+    """手动重新生成当天AI分析；不创建订单，也不直接成交。"""
+    if not ANALYSIS_REGEN_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="分析任务正在运行，请稍后再试")
+    try:
+        from src.orchestrator import run_morning_pipeline
+        result = run_morning_pipeline(dry_run=False, force=True, date_str=date.today().isoformat())
+        llm_status = result.get("source_status", {}).get("llm", "unknown")
+        return ApiResponse.ok({
+            "status": result.get("status", "unknown"),
+            "llm_status": llm_status,
+            "errors": result.get("errors", []),
+            "message": "AI分析已恢复" if llm_status == "success" else "重新分析完成，但LLM仍处于降级状态",
+        })
+    finally:
+        ANALYSIS_REGEN_LOCK.release()
 
 
 # API: 获取所有时段推荐（自动查找最近可用数据）
@@ -400,6 +426,7 @@ async def get_performance(date_str: Optional[str] = None):
         "cash": account["cash"],
         "market_value": account["market_value"],
         "realized_pnl": account["realized_pnl"],
+        "unrealized_pnl": account["unrealized_pnl"],
         "positions_count": len(service.get_positions(date_str)),
     }
 
@@ -544,27 +571,6 @@ def get_auto_trade_log(date_str: str):
 async def trigger_auto_trade():
     """Manually trigger auto-trading based on latest recommendation"""
     return ApiResponse.fail("旧自动交易入口已停用；请使用09:35最终计划和飞书否决流程")
-    from src.paper_trading.auto_trader import AutoTrader
-    from src.reporting.report_store import load_report
-    from datetime import timedelta
-
-    # Find latest recommendation
-    today = date.today()
-    recommendation = None
-    rec_date = None
-    for offset in range(0, 4):
-        target = (today - timedelta(days=offset)).isoformat()
-        recommendation = load_report(target, "morning")
-        if recommendation:
-            rec_date = target
-            break
-
-    if not recommendation:
-        return ApiResponse.fail("No recommendation found for auto-trading")
-
-    trader = AutoTrader()
-    result = trader.execute_morning_trades(recommendation, rec_date)
-    return result
 
 
 # API: 更新持仓价格
@@ -607,12 +613,15 @@ def get_safe_orders(status: Optional[str] = None):
 @app.post("/api/paper/open")
 def prepare_open_orders(date_str: Optional[str] = None):
     """09:35重新取价、创建订单并发送飞书交互卡片。"""
+    from src.analysis.recovery import recover_degraded_morning_report
     from src.paper_trading.workflow import PaperTradingWorkflow
     from src.reporting.report_store import load_report
     target = date_str or date.today().isoformat()
     report = load_report(target, "morning")
     if not report:
         return ApiResponse.fail(f"未找到 {target} 的盘前报告")
+    recovery = recover_degraded_morning_report(target, report=report)
+    report = recovery.get("report") or report
     return PaperTradingWorkflow().prepare_final_orders(report, report.get("source_status", {}))
 
 
@@ -643,31 +652,34 @@ def run_intraday_check():
 async def feishu_callback(request: Request):
     """飞书卡片回调；此路由用Verification Token独立鉴权。"""
     from src.notifier.feishu import FeishuNotifier
-    from src.paper_trading.trading_service import TradingService
+    from src.notifier.feishu_actions import process_card_action
 
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
     notifier = FeishuNotifier()
-    if not notifier.verify_callback(payload):
-        raise HTTPException(status_code=401, detail="飞书回调Token无效")
     if payload.get("type") == "url_verification":
+        logger.info("feishu_callback type=url_verification")
         return {"challenge": payload.get("challenge")}
     action = notifier.parse_card_action(payload)
-    if not action.get("order_id") or action.get("action") not in {"confirm", "veto", "pause_day"}:
-        raise HTTPException(status_code=400, detail="飞书卡片动作不完整")
-    order = TradingService().record_decision(
-        action["order_id"],
-        action["action"],
-        actor=action["actor"],
-        event_id=action.get("event_id"),
+    if (
+        action.get("action") == "ping"
+        and notifier.is_legacy_card_callback(payload, dict(request.headers))
+    ):
+        logger.info("feishu_callback verified=legacy action=ping")
+        return {"toast": {"type": "success", "content": "飞书回调链路正常"}}
+    if not notifier.verify_callback(payload):
+        logger.warning("feishu_callback verified=false")
+        raise HTTPException(status_code=401, detail="飞书回调Token无效")
+    action_name = action.get("action")
+    logger.info(
+        "feishu_callback verified=true action=%s has_order_id=%s has_event_id=%s",
+        action_name if action_name in {"ping", "confirm", "veto", "pause_day"} else "unknown",
+        bool(action.get("order_id")),
+        bool(action.get("event_id")),
     )
-    execution = None
-    if action["action"] == "confirm":
-        from src.paper_trading.workflow import PaperTradingWorkflow
-        execution = PaperTradingWorkflow().execute_due_orders()
-    return {
-        "toast": {"type": "success", "content": f"订单已更新为 {order['status']}"},
-        "execution": execution,
-    }
+    return process_card_action(action)
 
 
 # API: 获取策略参数
@@ -723,8 +735,7 @@ def get_asset_analysis():
     by_day = {}
     for snapshot in snapshots:
         by_day[snapshot["captured_at"][:10]] = float(snapshot["total_equity"])
-    if not by_day:
-        by_day[date.today().isoformat()] = account["total_equity"]
+    by_day[date.today().isoformat()] = account["total_equity"]
     daily = []
     for day, equity in sorted(by_day.items()):
         daily.append({
