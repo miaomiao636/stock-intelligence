@@ -352,6 +352,7 @@
     // ============ CACHE ============
     let cachedRec = null;  // Current (latest) recommendation
     let cachedAccount = null;
+    let liveSnapshot = null;  // 只读实时行情快照，不写入交易状态
     let allRecommendations = [];  // All time periods
     let currentTimePeriod = 'all';
     let maxStockPrice = parseInt(sessionStorage.getItem('maxStockPrice')) || 200;  // Restore from sessionStorage
@@ -518,6 +519,40 @@
         }
     }
 
+    function applyLiveQuotes(snapshot) {
+        if (!snapshot || typeof snapshot !== 'object') return;
+        liveSnapshot = snapshot;
+        const quotes = snapshot.quotes || {};
+        allRecommendations.forEach(period => {
+            (period.data?.stock_recommendations || []).forEach(stock => {
+                const quote = quotes[stock.code];
+                if (!quote) return;
+                stock.latest_price = Number(quote.price) || stock.latest_price;
+                stock.latest_quote_time = quote.quote_time || stock.latest_quote_time;
+                stock.latest_quote_source = quote.source || stock.latest_quote_source;
+            });
+        });
+        if (cachedRec && !allRecommendations.some(period => period.data === cachedRec)) {
+            (cachedRec.stock_recommendations || []).forEach(stock => {
+                const quote = quotes[stock.code];
+                if (quote) stock.latest_price = Number(quote.price) || stock.latest_price;
+            });
+        }
+    }
+
+    async function loadLiveSnapshot() {
+        try {
+            const response = await apiFetch('/api/live/quotes');
+            if (!response.ok) return null;
+            const snapshot = await response.json();
+            applyLiveQuotes(snapshot);
+            return snapshot;
+        } catch (error) {
+            console.warn('实时行情刷新失败', error);
+            return null;
+        }
+    }
+
     // ============ INIT ============
     async function init() {
         // Load all time period recommendations
@@ -536,6 +571,7 @@
                 if (res.ok) cachedRec = await res.json();
             } catch(e) {}
         }
+        await loadLiveSnapshot();
         // Load price threshold from strategy params (server is source of truth)
         try {
             const res = await apiFetch('/api/strategy/params');
@@ -556,7 +592,10 @@
         renderSectors();
         renderRiskWarnings();
         // Phase 1: Critical (fast)
-        await Promise.all([loadAccount(), loadPositions()]);
+        await Promise.all([
+            loadAccount(liveSnapshot?.account),
+            loadPositions(liveSnapshot?.positions),
+        ]);
         // Phase 2: Secondary
         await Promise.all([loadHistory(), loadControlPanel(), loadAssetAnalysis()]);
         // Phase 3: Heavy (delayed to not block initial render)
@@ -592,12 +631,16 @@
         const summary = document.getElementById('market-summary');
         const dt = document.getElementById('data-time');
         if (!cachedRec || cachedRec.error) { el.innerHTML = '<span class="empty">暂无指数数据</span>'; return; }
-        const md = cachedRec.market_data || {};
+        const md = liveSnapshot?.market_data || cachedRec.market_data || {};
         const idx = md.indices || {};
         const rm = { bullish:'🟢 看多', bearish:'🔴 看空', neutral:'🟡 震荡', high_volatility:'🟠 高波动' };
         regime.textContent = rm[cachedRec.market_regime] || cachedRec.market_regime || '-';
         summary.textContent = cachedRec.market_summary || '';
-        dt.textContent = cachedRec.data_as_of ? '数据: ' + cachedRec.data_as_of.substring(0,16) : '';
+        const sessionLabel = {
+            trading:'实时行情', lunch_break:'午间休市', pre_open:'盘前行情', closed:'已收盘'
+        }[liveSnapshot?.market_session] || '报告行情';
+        const dataTime = liveSnapshot?.fetched_at || cachedRec.data_as_of || '';
+        dt.textContent = dataTime ? `${sessionLabel}: ${String(dataTime).substring(0,19).replace('T', ' ')}` : '';
         let h = '';
         for (const [c, i] of Object.entries(idx)) {
             const ch = Number(i.change_pct) || 0;
@@ -609,11 +652,15 @@
     }
 
     // ============ ACCOUNT ============
-    async function loadAccount() {
+    async function loadAccount(liveAccount = null) {
         try {
-            const res = await apiFetch('/api/performance');
-            if (!res.ok) return;
-            cachedAccount = await res.json();
+            if (liveAccount) {
+                cachedAccount = liveAccount;
+            } else {
+                const res = await apiFetch('/api/performance');
+                if (!res.ok) return;
+                cachedAccount = await res.json();
+            }
             if (cachedAccount.error) return;
             const d = cachedAccount;
             const ret = Number(d.net_return_after_costs ?? (d.total_equity - d.initial_cash));
@@ -683,7 +730,7 @@
             const entryDate = s.entry_date ? formatDate(s.entry_date) : '-';
             const exitDate = s.expiry_date ? formatDate(s.expiry_date) : '-';
             const inc = s.incremental_basis || '';
-            const price = Number(s.current_price) || 0;
+            const price = Number(s.latest_price ?? s.current_price) || 0;
             const safeCode = String(s.code||'').replace(/[^A-Za-z0-9_-]/g, '_');
             const altId = `alt-${safeCode}-${i}`;
             const stockKey = `${currentTimePeriod}-${safeCode}-${i}`;
@@ -801,13 +848,16 @@
     }
 
     // ============ POSITIONS ============
-    async function loadPositions() {
+    async function loadPositions(livePositions = null) {
         const el = document.getElementById('positions');
         const count = document.getElementById('pos-count');
         try {
-            const res = await apiFetch('/api/positions');
-            if (!res.ok) { el.innerHTML = '<div class="empty">加载失败</div>'; return; }
-            const data = await res.json();
+            let data = livePositions;
+            if (!Array.isArray(data)) {
+                const res = await apiFetch('/api/positions');
+                if (!res.ok) { el.innerHTML = '<div class="empty">加载失败</div>'; return; }
+                data = await res.json();
+            }
             count.textContent = data.length ? `(${data.length}只)` : '';
             if (!data.length) { el.innerHTML = '<div class="empty">暂无持仓（模拟操盘后自动显示）</div>'; return; }
 
@@ -1409,9 +1459,10 @@
         const am = { setup_ready:'可进场', track:'跟踪观察', watch:'观望', hold:'持有', avoid:'回避' };
         const t = s.timing || {};
         const observationOnly = Boolean(s.degraded) || ['fallback', 'error', 'degraded'].includes(cachedRec?.source_status?.llm);
+        const displayPrice = s.latest_price ?? s.current_price;
         const priceSummary = observationOnly
-            ? `<p><strong>当前价:</strong> ${fmtPrice(s.current_price)} · <strong>状态:</strong> 仅观察，无AI进场/目标/止损信号</p>`
-            : `<p><strong>当前价:</strong> ${fmtPrice(s.current_price)} → <strong>进场:</strong> ${fmtPrice(s.entry_price||t.entry_price)} → <strong>目标:</strong> <span class="up">${fmtPrice(s.target_price||t.target_observation_price)}</span> / <span class="down">止损: ${fmtPrice(s.stop_loss_price||t.stop_loss_price)}</span></p>`;
+            ? `<p><strong>当前价:</strong> ${fmtPrice(displayPrice)} · <strong>状态:</strong> 仅观察，无AI进场/目标/止损信号</p>`
+            : `<p><strong>当前价:</strong> ${fmtPrice(displayPrice)} → <strong>进场:</strong> ${fmtPrice(s.entry_price||t.entry_price)} → <strong>目标:</strong> <span class="up">${fmtPrice(s.target_price||t.target_observation_price)}</span> / <span class="down">止损: ${fmtPrice(s.stop_loss_price||t.stop_loss_price)}</span></p>`;
         showModal(`<h2>${esc(s.name||'-')} (${esc(s.code)})</h2><hr>
             <p><strong>板块:</strong> ${esc(s.sector||'-')} · <strong>操作:</strong> ${esc(am[s.action]||s.action)} · <strong>周期:</strong> ${s.horizon==='short'?'短期':s.horizon==='medium'?'中期':'长期'} ${Number(s.horizon_days)||''}天</p>
             ${priceSummary}
@@ -1553,26 +1604,42 @@
     });
 
     // ============ LIGHT REFRESH (preserves user state) ============
+    let refreshInFlight = false;
     async function refreshData() {
+        if (document.hidden || refreshInFlight) return;
+        refreshInFlight = true;
         try {
-            const res = await apiFetch('/api/recommendations/all');
-            if (res.ok) {
-                allRecommendations = await res.json();
+            const [reportsResult, liveResult] = await Promise.allSettled([
+                apiFetch('/api/recommendations/all'),
+                apiFetch('/api/live/quotes'),
+            ]);
+            if (reportsResult.status === 'fulfilled' && reportsResult.value.ok) {
+                allRecommendations = await reportsResult.value.json();
                 if (allRecommendations.length > 0) {
                     cachedRec = allRecommendations[allRecommendations.length - 1].data;
                 }
             }
-        } catch(e) {}
-        renderIndices();
-        renderRecommendation();
-        renderNews();
-        renderSectors();
-        renderRiskWarnings();
-        loadAccount();
-        loadPositions();
-        loadAutoTrades();
-        loadTracking();
-        // Don't re-render control panel, weekly review, or history (heavy or user may be interacting)
+            if (liveResult.status === 'fulfilled' && liveResult.value.ok) {
+                applyLiveQuotes(await liveResult.value.json());
+            }
+            renderTimeTabs();
+            renderIndices();
+            renderRecommendation();
+            renderNews();
+            renderSectors();
+            renderRiskWarnings();
+            await Promise.all([
+                loadAccount(liveSnapshot?.account),
+                loadPositions(liveSnapshot?.positions),
+                loadAutoTrades(),
+                loadTracking(),
+            ]);
+            // Don't re-render control panel, weekly review, or history (heavy or user may be interacting)
+        } catch(e) {
+            console.warn('自动刷新失败', e);
+        } finally {
+            refreshInFlight = false;
+        }
     }
 
     // ============ GLOBAL ERROR HANDLER ============
@@ -1582,7 +1649,10 @@
     });
 
     // ============ AUTO REFRESH ============
-    setInterval(refreshData, 5 * 60 * 1000);
+    setInterval(refreshData, 60 * 1000);
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) refreshData();
+    });
     window.onload = bootstrap;
     </script>
 </body>

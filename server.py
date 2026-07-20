@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """FastAPI后端"""
 
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import os
 import logging
@@ -398,6 +399,103 @@ def _enrich_stock_prices(report: dict):
                 stock["latest_quote_source"] = quote.get("source")
     except Exception as e:
         print(f"  Price enrichment failed: {e}")
+
+
+def _collect_live_quote_codes(service, lookback_days: int = 4) -> List[str]:
+    """收集页面会展示的推荐与持仓代码，避免开放任意代码查询。"""
+    from src.reporting.report_store import load_report
+
+    codes = set()
+    for offset in range(max(1, lookback_days)):
+        target = (date.today() - timedelta(days=offset)).isoformat()
+        for report_type in ("morning", "afternoon", "closing"):
+            report = load_report(target, report_type)
+            if not report:
+                continue
+            for stock in report.get("stock_recommendations", []):
+                code = str(stock.get("code") or "").strip()
+                if code.isdigit() and len(code) == 6:
+                    codes.add(code)
+    for position in service.get_positions(date.today().isoformat()):
+        code = str(position.get("code") or "").strip()
+        if code.isdigit() and len(code) == 6:
+            codes.add(code)
+    return sorted(codes)[:100]
+
+
+def _market_session_status(now: datetime) -> str:
+    """返回前端展示用的A股时段，不参与任何交易决策。"""
+    if now.weekday() >= 5:
+        return "closed"
+    current = now.time().replace(tzinfo=None)
+    if time(9, 30) <= current <= time(11, 30) or time(13, 0) <= current <= time(15, 0):
+        return "trading"
+    if current < time(9, 30):
+        return "pre_open"
+    if time(11, 30) < current < time(13, 0):
+        return "lunch_break"
+    return "closed"
+
+
+@app.get("/api/live/quotes")
+def get_live_quotes():
+    """返回页面每60秒使用的只读行情；绝不写账本、创建订单或触发分析。"""
+    from src.data_collectors.market_data import get_realtime_market_overview
+    from src.data_collectors.realtime_prices import fetch_realtime_prices
+    from src.paper_trading.trading_service import TradingService
+
+    service = TradingService()
+    codes = _collect_live_quote_codes(service)
+    quotes = fetch_realtime_prices(codes)
+    positions = []
+    live_market_value = 0.0
+    for original in service.get_positions(date.today().isoformat()):
+        position = dict(original)
+        quote = quotes.get(position.get("code"), {})
+        current_price = float(quote.get("price") or position.get("current_price") or 0)
+        quantity = int(position.get("quantity") or 0)
+        avg_cost = float(position.get("avg_cost") or 0)
+        market_value = round(current_price * quantity, 2)
+        pnl_amount = round((current_price - avg_cost) * quantity, 2)
+        pnl_pct = round((current_price / avg_cost - 1) * 100, 2) if avg_cost else 0.0
+        position.update({
+            "current_price": current_price,
+            "market_value": market_value,
+            "unrealized_pnl": pnl_amount,
+            "unrealized_pnl_pct": pnl_pct,
+            "latest_quote_time": quote.get("quote_time"),
+            "latest_quote_source": quote.get("source"),
+        })
+        live_market_value += market_value
+        positions.append(position)
+
+    account = service.get_account()
+    performance = service.get_performance_metrics()
+    live_total_equity = round(float(account.get("cash") or 0) + live_market_value, 2)
+    principal = float(performance.get("effective_principal") or account.get("initial_cash") or 0)
+    net_return = round(live_total_equity - principal, 2)
+    net_return_pct = round(net_return / principal * 100, 4) if principal else 0.0
+    live_account = {
+        **performance,
+        "cash": float(account.get("cash") or 0),
+        "market_value": round(live_market_value, 2),
+        "total_equity": live_total_equity,
+        "net_return": net_return,
+        "net_return_pct": net_return_pct,
+        "net_return_after_costs": net_return,
+        "net_return_after_costs_pct": net_return_pct,
+    }
+
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    return {
+        "fetched_at": now.isoformat(),
+        "market_session": _market_session_status(now),
+        "refresh_after_seconds": 60,
+        "market_data": get_realtime_market_overview(),
+        "quotes": quotes,
+        "positions": positions,
+        "account": live_account,
+    }
 
 
 # API: 获取评估结果
