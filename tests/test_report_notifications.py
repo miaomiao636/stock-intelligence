@@ -241,3 +241,15 @@ def test_deploy_cron_contains_afternoon_pipeline_and_watchdog():
     assert "15 13 * * 1-5" in text
     assert "daily --mode afternoon" in text
     assert "notify --mode afternoon --if-missing" in text
+
+
+def test_ubuntu_update_preserves_env_and_installs_persistent_feishu_ws():
+    script = (Path(__file__).resolve().parents[1] / "deploy" / "update_ubuntu.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "EnvironmentFile=${PROJECT_DIR}/.env" in script
+    assert "ExecStart=${PROJECT_DIR}/.venv/bin/python -m src.notifier.feishu_ws" in script
+    assert "systemctl restart \"${SERVICE_NAME}.service\"" in script
+    assert "Existing .env and data were preserved" in script
+    assert "cp .env.example .env" not in script

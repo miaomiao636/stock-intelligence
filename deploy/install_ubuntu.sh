@@ -166,6 +166,27 @@ EOF
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 
+cat >/etc/systemd/system/${SERVICE_NAME}-feishu-ws.service <<EOF
+[Unit]
+Description=Stock Intelligence Feishu WebSocket Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${PROJECT_DIR}
+EnvironmentFile=${PROJECT_DIR}/.env
+ExecStart=${PROJECT_DIR}/.venv/bin/python -m src.notifier.feishu_ws
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now "${SERVICE_NAME}-feishu-ws"
+
 echo "[7/9] Installing Nginx site..."
 cat >/etc/nginx/sites-available/${SERVICE_NAME} <<EOF
 server {
