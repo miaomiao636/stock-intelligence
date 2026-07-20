@@ -8,7 +8,7 @@ import time
 from typing import Dict, List, Optional
 
 from src.analysis.llm_client import LLMClient
-from src.analysis.prompts import MORNING_ANALYSIS_PROMPT, FALLBACK_TEMPLATE
+from src.analysis.prompts import AFTERNOON_ANALYSIS_PROMPT, MORNING_ANALYSIS_PROMPT, FALLBACK_TEMPLATE
 from src.analysis.validators import validate_llm_output, apply_action_rules
 
 
@@ -69,6 +69,45 @@ class Synthesizer:
         result["data_quality"] = data_quality
         result["adjusted_weights"] = adjusted_weights
 
+        return result
+
+    def analyze_afternoon(
+        self,
+        market_data: Dict,
+        morning_report: Dict,
+        news_list: List[Dict],
+        factor_weights: Dict,
+        sector_allocations: Dict,
+        custom_params: Dict = None,
+    ) -> Dict:
+        """复核上午观点；失败时由调用方生成不可交易的确定性降级报告。"""
+        data_quality = self._check_data_availability(market_data, news_list)
+        adjusted_weights = self._adjust_weights_for_data_quality(factor_weights, data_quality)
+        strategy_desc = self._format_strategy_params(
+            custom_params or {}, adjusted_weights, sector_allocations
+        )
+        prompt = AFTERNOON_ANALYSIS_PROMPT.format(
+            market_data=json.dumps(market_data, ensure_ascii=False, indent=2),
+            morning_report=json.dumps(morning_report, ensure_ascii=False, indent=2),
+            news_summary=self._format_news_summary(news_list),
+            strategy_params=strategy_desc,
+        )
+        if self.llm_client.is_available():
+            result = self._try_llm_analysis(prompt, market_data)
+        else:
+            result = {
+                "status": "fallback",
+                "data": {},
+                "source": "afternoon_deterministic_fallback",
+                "diagnostics": [{
+                    "phase": "availability",
+                    "attempt": 0,
+                    "status": "failed",
+                    "error": "LLM客户端未初始化，请检查LLM_API_KEY配置",
+                }],
+            }
+        result["data_quality"] = data_quality
+        result["adjusted_weights"] = adjusted_weights
         return result
     
     def _try_llm_analysis(self, prompt: str, market_data: Dict = None) -> Dict:

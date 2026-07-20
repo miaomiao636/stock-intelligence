@@ -84,6 +84,72 @@ def format_morning_report(
     return "\n".join(lines)
 
 
+def format_afternoon_report(
+    date_str: str,
+    market_data: Dict,
+    stock_recommendations: List[Dict],
+    summary: Dict | None = None,
+    degraded: bool = False,
+) -> str:
+    """格式化13:15盘中复核；明确说明仅分析、不直接成交。"""
+    summary = summary if isinstance(summary, dict) else {}
+    lines = [f"☀️ 下午盘中复核 - {date_str}", ""]
+    if degraded:
+        lines.extend([
+            "⚠️ 盘中研判已降级",
+            "  已刷新真实行情，但AI复核不可用；以下仅保留上午观点供观察，不触发交易。",
+            "",
+        ])
+    lines.append("📈 13:15市场概况")
+    indices = market_data.get("indices", {}) if isinstance(market_data, dict) else {}
+    if indices:
+        for code, item in indices.items():
+            if not isinstance(item, dict):
+                continue
+            close = item.get("close")
+            change = item.get("change_pct")
+            close_text = f"{close:.2f}" if isinstance(close, (int, float)) else "--"
+            change_text = f" ({change:+.2f}%)" if isinstance(change, (int, float)) else ""
+            lines.append(f"  · {item.get('name') or code}: {close_text}{change_text}")
+    else:
+        lines.append("  盘中指数暂不可用")
+
+    lines.extend([
+        "",
+        "🧭 相对上午的判断",
+        f"  维持 {summary.get('maintain', 0)} · 升级 {summary.get('upgrade', 0)} · "
+        f"降级 {summary.get('downgrade', 0)} · 取消 {summary.get('cancel', 0)}",
+        "",
+        "📋 个股复核",
+    ])
+    decision_map = {
+        "maintain": "维持",
+        "upgrade": "升级",
+        "downgrade": "降级",
+        "cancel": "取消",
+    }
+    for stock in stock_recommendations:
+        decision = decision_map.get(stock.get("afternoon_decision"), "维持")
+        price = stock.get("latest_price") or stock.get("current_price")
+        price_text = f"¥{price:.2f}" if isinstance(price, (int, float)) else "--"
+        since_morning = stock.get("since_morning_pct")
+        change_text = f"，较上午{since_morning:+.2f}%" if isinstance(since_morning, (int, float)) else ""
+        lines.append(
+            f"  · {stock.get('name', '')}({stock.get('code', '')}) {decision} | {price_text}{change_text}"
+        )
+        reason = str(stock.get("incremental_basis") or stock.get("reason") or "")
+        if reason:
+            lines.append(f"    {reason[:80]}")
+    if not stock_recommendations:
+        lines.append("  暂无上午候选可复核")
+    lines.extend([
+        "",
+        "🛡️ 本报告仅更新研究判断，不会绕过5分钟否决和既有风控直接成交。",
+        "📌 免责声明: 以下为研究信号，不构成买卖建议。",
+    ])
+    return "\n".join(lines)
+
+
 def format_closing_report(
     date_str: str,
     market_data: Dict,

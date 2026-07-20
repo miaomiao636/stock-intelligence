@@ -8,7 +8,7 @@ from typing import Optional
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # 报告类型白名单
-_REPORT_TYPES = {"morning", "closing"}
+_REPORT_TYPES = {"morning", "afternoon", "closing"}
 
 
 def validate_date_str(date_str: Optional[str], field: str = "date_str") -> Optional[str]:

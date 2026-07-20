@@ -126,7 +126,11 @@ class FeishuNotifier:
         return self._post_with_retry(self.webhook_url, {"msg_type": "interactive", "card": card})
 
     def send_report(self, report_content: str, report_type: str = "morning") -> Dict:
-        title = "盘前智能推荐" if report_type == "morning" else "盘后复盘报告"
+        title = {
+            "morning": "盘前智能推荐",
+            "afternoon": "下午盘中复核",
+            "closing": "盘后复盘报告",
+        }.get(report_type, "股票分析报告")
         return self.send_message(title, report_content)
 
     def send_trade_plan(self, order: Dict) -> Dict:

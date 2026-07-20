@@ -41,6 +41,7 @@ class RecommendationStatus(str, Enum):
 class RecommendationType(str, Enum):
     """推荐时间类型"""
     MORNING = "morning"
+    AFTERNOON = "afternoon"
     CLOSING = "closing"
 
 

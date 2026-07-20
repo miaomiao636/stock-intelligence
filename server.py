@@ -226,7 +226,7 @@ async def get_all_recommendations():
     for day_offset in range(0, 4):
         target = (today - timedelta(days=day_offset))
 
-        # Try closing first (more recent analysis)
+        # 收盘分析
         closing = load_report(target.isoformat(), "closing")
         if closing:
             _enrich_stock_prices(closing)
@@ -237,6 +237,19 @@ async def get_all_recommendations():
                 "date": target.isoformat(),
                 "type": "closing",
                 "data": closing,
+            })
+
+        # 13:15盘中复核
+        afternoon = load_report(target.isoformat(), "afternoon")
+        if afternoon:
+            _enrich_stock_prices(afternoon)
+            result.append({
+                "label": f"{target.isoformat()} 下午复核 (13:15)",
+                "period": f"{target.isoformat()}_afternoon",
+                "time": "13:15",
+                "date": target.isoformat(),
+                "type": "afternoon",
+                "data": afternoon,
             })
 
         # Try morning
@@ -256,8 +269,9 @@ async def get_all_recommendations():
         if result:
             break
 
-    # Sort: morning first, then closing (chronological within same day)
-    result.sort(key=lambda r: (r["date"], r["type"]))
+    # 同一天严格按盘前、下午、收盘排列。
+    type_order = {"morning": 0, "afternoon": 1, "closing": 2}
+    result.sort(key=lambda r: (r["date"], type_order.get(r["type"], 99)))
     return result
 
 
@@ -416,7 +430,11 @@ def _collect_live_quote_codes(service, lookback_days: int = 4) -> List[str]:
                 code = str(stock.get("code") or "").strip()
                 if code.isdigit() and len(code) == 6:
                     codes.add(code)
-    for position in service.get_positions(date.today().isoformat()):
+    try:
+        current_positions = service.get_positions(date.today().isoformat())
+    except Exception:
+        current_positions = []
+    for position in current_positions:
         code = str(position.get("code") or "").strip()
         if code.isdigit() and len(code) == 6:
             codes.add(code)
@@ -449,7 +467,11 @@ def get_live_quotes():
     quotes = fetch_realtime_prices(codes)
     positions = []
     live_market_value = 0.0
-    for original in service.get_positions(date.today().isoformat()):
+    try:
+        stored_positions = service.get_positions(date.today().isoformat())
+    except Exception:
+        stored_positions = []
+    for original in stored_positions:
         position = dict(original)
         quote = quotes.get(position.get("code"), {})
         current_price = float(quote.get("price") or position.get("current_price") or 0)
@@ -469,22 +491,26 @@ def get_live_quotes():
         live_market_value += market_value
         positions.append(position)
 
-    account = service.get_account()
-    performance = service.get_performance_metrics()
-    live_total_equity = round(float(account.get("cash") or 0) + live_market_value, 2)
-    principal = float(performance.get("effective_principal") or account.get("initial_cash") or 0)
-    net_return = round(live_total_equity - principal, 2)
-    net_return_pct = round(net_return / principal * 100, 4) if principal else 0.0
-    live_account = {
-        **performance,
-        "cash": float(account.get("cash") or 0),
-        "market_value": round(live_market_value, 2),
-        "total_equity": live_total_equity,
-        "net_return": net_return,
-        "net_return_pct": net_return_pct,
-        "net_return_after_costs": net_return,
-        "net_return_after_costs_pct": net_return_pct,
-    }
+    try:
+        account = service.get_account()
+        performance = service.get_performance_metrics()
+        live_total_equity = round(float(account.get("cash") or 0) + live_market_value, 2)
+        principal = float(performance.get("effective_principal") or account.get("initial_cash") or 0)
+        net_return = round(live_total_equity - principal, 2)
+        net_return_pct = round(net_return / principal * 100, 4) if principal else 0.0
+        live_account = {
+            **performance,
+            "cash": float(account.get("cash") or 0),
+            "market_value": round(live_market_value, 2),
+            "total_equity": live_total_equity,
+            "net_return": net_return,
+            "net_return_pct": net_return_pct,
+            "net_return_after_costs": net_return,
+            "net_return_after_costs_pct": net_return_pct,
+        }
+    except RuntimeError:
+        # 新部署尚未初始化模拟账户时，实时指数与推荐价格仍必须可用。
+        live_account = None
 
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     return {

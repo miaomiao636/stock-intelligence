@@ -24,7 +24,7 @@ def _source_status_icon(status: str) -> str:
     value = str(status or "")
     if value in {"ok", "success"} or value.startswith("ok_"):
         return "✅"
-    if value in {"degraded", "fallback"}:
+    if value in {"degraded", "fallback"} or value.startswith("degraded_"):
         return "⚠️"
     if value.startswith("deferred_"):
         return "ℹ️"
@@ -42,6 +42,17 @@ def _format_report_notification(date_str: str, mode: str, report: dict, result: 
             market_data=result.get("market_data") or report.get("market_data", {}),
             evaluation=result.get("evaluation") or report.get("evaluation", {}),
             warnings=result.get("warnings") or report.get("warnings", []),
+        )
+
+    if mode == "afternoon":
+        from src.reporting.formatter import format_afternoon_report
+
+        return format_afternoon_report(
+            date_str=date_str,
+            market_data=report.get("market_data", {}),
+            stock_recommendations=report.get("stock_recommendations", []),
+            summary=report.get("afternoon_summary", {}),
+            degraded=bool(report.get("analysis_degraded")),
         )
 
     from src.reporting.formatter import format_morning_report
@@ -414,7 +425,7 @@ def demo():
 
 
 @cli.command()
-@click.option("--mode", type=click.Choice(["morning", "closing"]), required=True)
+@click.option("--mode", type=click.Choice(["morning", "afternoon", "closing"]), required=True)
 @click.option("--dry-run", is_flag=True, help="干运行，不写入文件")
 @click.option("--no-notify", is_flag=True, help="不推送飞书")
 @click.option("--force", is_flag=True, help="强制重新生成")
@@ -437,6 +448,9 @@ def daily(mode, dry_run, no_notify, force, date_str):
         
         if mode == "morning":
             result = run_morning_pipeline(dry_run=dry_run, force=force, date_str=date_str)
+        elif mode == "afternoon":
+            from src.analysis.afternoon_pipeline import run_afternoon_pipeline
+            result = run_afternoon_pipeline(dry_run=dry_run, force=force, date_str=date_str)
         else:
             from src.evaluation.closing_pipeline import run_closing_pipeline
             result = run_closing_pipeline(dry_run=dry_run, force=force, date_str=date_str)
@@ -974,7 +988,7 @@ def suggestions():
 
 @cli.command()
 @click.option("--date", "date_str", help="日期 (YYYY-MM-DD)")
-@click.option("--mode", type=click.Choice(["morning", "closing"]), required=True)
+@click.option("--mode", type=click.Choice(["morning", "afternoon", "closing"]), required=True)
 @click.option("--if-missing", is_flag=True, help="仅在没有成功推送回执时补发")
 def notify(date_str, mode, if_missing):
     """重试飞书推送"""
@@ -1025,7 +1039,7 @@ def notify(date_str, mode, if_missing):
 
 @cli.command()
 @click.option("--date", "date_str", help="日期 (YYYY-MM-DD)")
-@click.option("--mode", type=click.Choice(["morning", "closing"]))
+@click.option("--mode", type=click.Choice(["morning", "afternoon", "closing"]))
 @click.option("--interactive", is_flag=True, help="优先通过飞书自建应用发送测试卡片")
 def notify_test(date_str, mode, interactive):
     """测试飞书推送"""

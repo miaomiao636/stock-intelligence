@@ -14,6 +14,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 def test_due_stage_windows_are_late_and_safe():
     assert reconcile.due_stage(datetime(2026, 7, 15, 9, 15, tzinfo=TZ)) == "morning"
     assert reconcile.due_stage(datetime(2026, 7, 15, 9, 55, tzinfo=TZ)) == "paper_open"
+    assert reconcile.due_stage(datetime(2026, 7, 15, 13, 30, tzinfo=TZ)) == "afternoon"
     assert reconcile.due_stage(datetime(2026, 7, 15, 17, 15, tzinfo=TZ)) == "closing"
     assert reconcile.due_stage(datetime(2026, 7, 15, 10, 30, tzinfo=TZ)) is None
     assert reconcile.due_stage(datetime(2026, 7, 18, 17, 15, tzinfo=TZ)) is None

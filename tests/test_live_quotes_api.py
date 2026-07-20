@@ -69,3 +69,44 @@ def test_dashboard_polls_read_only_live_quotes_every_60_seconds():
     assert "if (document.hidden || refreshInFlight) return" in html
     assert "document.addEventListener('visibilitychange'" in html
     assert "s.latest_price ?? s.current_price" in html
+    assert "r.type === 'afternoon' ? '下午'" in html
+
+
+def test_live_quotes_survives_uninitialized_account(monkeypatch):
+    class FakeService:
+        def get_positions(self, _=None):
+            return []
+
+        def get_account(self):
+            raise RuntimeError("模拟账户尚未初始化")
+
+        def get_performance_metrics(self):
+            raise AssertionError("未初始化时不应继续获取绩效")
+
+    monkeypatch.setattr(server, "_collect_live_quote_codes", lambda service: [])
+    monkeypatch.setattr("src.paper_trading.trading_service.TradingService", FakeService)
+    monkeypatch.setattr(
+        "src.data_collectors.realtime_prices.fetch_realtime_prices", lambda _: {}
+    )
+    monkeypatch.setattr(
+        "src.data_collectors.market_data.get_realtime_market_overview",
+        lambda: {"indices": {"000001": {"close": 3800}}},
+    )
+
+    response = TestClient(server.app).get("/api/live/quotes")
+
+    assert response.status_code == 200
+    assert response.json()["account"] is None
+    assert response.json()["market_data"]["indices"]
+
+
+def test_server_lists_afternoon_between_morning_and_closing(monkeypatch):
+    def fake_load(_, report_type):
+        return {"type": report_type, "stock_recommendations": []}
+
+    monkeypatch.setattr("src.reporting.report_store.load_report", fake_load)
+
+    payload = TestClient(server.app).get("/api/recommendations/all").json()
+
+    assert [item["type"] for item in payload] == ["morning", "afternoon", "closing"]
+    assert payload[1]["time"] == "13:15"

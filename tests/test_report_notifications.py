@@ -2,13 +2,14 @@
 """每日报告推送的回归测试。"""
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from cli import cli
 from src.notifier import report_delivery
-from src.reporting.formatter import format_closing_report
+from src.reporting.formatter import format_afternoon_report, format_closing_report
 
 
 @pytest.fixture(autouse=True)
@@ -211,3 +212,32 @@ def test_earlier_success_receipt_prevents_later_watchdog_duplicate():
     )
 
     assert report_delivery.has_successful_delivery("2026-07-14", "closing") is True
+
+
+def test_afternoon_formatter_marks_report_as_advisory_only():
+    content = format_afternoon_report(
+        "2026-07-20",
+        market_data={"indices": {}},
+        stock_recommendations=[{
+            "code": "000001",
+            "name": "平安银行",
+            "latest_price": 10.2,
+            "since_morning_pct": 2.0,
+            "afternoon_decision": "upgrade",
+            "incremental_basis": "盘中表现改善",
+        }],
+        summary={"maintain": 0, "upgrade": 1, "downgrade": 0, "cancel": 0},
+    )
+
+    assert "下午盘中复核" in content
+    assert "升级 1" in content
+    assert "不会绕过5分钟否决" in content
+
+
+def test_deploy_cron_contains_afternoon_pipeline_and_watchdog():
+    content = Path(__file__).resolve().parents[1] / "deploy" / "stock-intelligence.cron"
+    text = content.read_text(encoding="utf-8")
+
+    assert "15 13 * * 1-5" in text
+    assert "daily --mode afternoon" in text
+    assert "notify --mode afternoon --if-missing" in text

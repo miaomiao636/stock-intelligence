@@ -200,6 +200,8 @@ DIR=${PROJECT_DIR}
 5 0 * * * root /bin/bash \$DIR/deploy/rotate_logs.sh
 45 8 * * 1-5 root cd \$DIR && \$PY cli.py daily --mode morning >> /var/log/stock-intelligence-morning.log 2>&1
 55 8 * * 1-5 root cd \$DIR && \$PY cli.py notify --mode morning --if-missing >> /var/log/stock-intelligence-watchdog.log 2>&1
+15 13 * * 1-5 root cd \$DIR && \$PY cli.py daily --mode afternoon >> /var/log/stock-intelligence-afternoon.log 2>&1
+25 13 * * 1-5 root cd \$DIR && \$PY cli.py notify --mode afternoon --if-missing >> /var/log/stock-intelligence-watchdog.log 2>&1
 35 9 * * 1-5 root cd \$DIR && \$PY cli.py paper open >> /var/log/stock-intelligence-open.log 2>&1
 45 9 * * 1-5 root cd \$DIR && \$PY cli.py paper open --if-missing >> /var/log/stock-intelligence-open-watchdog.log 2>&1
 * 9-14 * * 1-5 root cd \$DIR && \$PY cli.py paper execute-due >> /var/log/stock-intelligence-execute.log 2>&1

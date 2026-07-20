@@ -33,6 +33,8 @@ def due_stage(now: datetime) -> Optional[str]:
         return "morning"
     if time(9, 50) <= current < time(10, 5):
         return "paper_open"
+    if time(13, 25) <= current < time(13, 45):
+        return "afternoon"
     if time(17, 10) <= current <= time(23, 59, 59):
         return "closing"
     return None
