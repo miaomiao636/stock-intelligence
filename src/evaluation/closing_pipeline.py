@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from src.data_collectors.trading_calendar import is_trading_day
-from src.data_collectors.market_data import get_market_overview
+from src.data_collectors.market_data import get_market_overview_on
 from src.evaluation.evaluator import Evaluator
 from src.reporting.report_store import load_report
 
@@ -38,7 +38,7 @@ def run_closing_pipeline(
 
     # 3. 获取收盘行情
     try:
-        market_data = get_market_overview()
+        market_data = get_market_overview_on(today)
         if "error" in market_data:
             source_status["market_data"] = "error"
             errors.append(f"市场数据获取失败: {market_data['error']}")
@@ -58,14 +58,29 @@ def run_closing_pipeline(
         eval_status = evaluation.get("status", "unknown")
         eval_error_rate = evaluation.get("quality", {}).get("error_rate", 0)
 
+        benchmark_error = evaluation.get("benchmark_error")
+        eval_error_count = evaluation.get("quality", {}).get("error", 0)
+        eval_total = evaluation.get("quality", {}).get("total", 0)
+
         if eval_status == "error":
             source_status["evaluation"] = "error"
-            warnings.append(f"评估失败: error_rate={eval_error_rate:.1%}")
+            if eval_error_count:
+                warnings.append(
+                    f"个股评估失败 {eval_error_count}/{eval_total}，error_rate={eval_error_rate:.1%}"
+                )
         elif eval_status == "degraded":
             source_status["evaluation"] = "degraded"
-            warnings.append(f"评估降级: error_rate={eval_error_rate:.1%}")
+            if eval_error_count:
+                warnings.append(
+                    f"个股评估缺失 {eval_error_count}/{eval_total}，error_rate={eval_error_rate:.1%}"
+                )
         else:
             source_status["evaluation"] = "ok"
+
+        if benchmark_error:
+            warnings.append(f"沪深300基准数据不可用: {benchmark_error}")
+        elif eval_status in {"error", "degraded"} and not eval_error_count:
+            warnings.append("评估质量未达标，请查看评估详情")
 
     except Exception as e:
         source_status["evaluation"] = "error"

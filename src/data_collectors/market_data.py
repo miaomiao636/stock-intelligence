@@ -4,7 +4,7 @@
 import json
 import os
 import urllib.request
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 from typing import Dict, List, Optional
 
 # 绕过VPN代理：国内金融API直连（TUN模式下代理无法连接eastmoney/sina等）
@@ -55,6 +55,30 @@ def _stock_code_to_secid(code: str) -> str:
         return f"0.{code}"  # 北交所
     else:
         return f"0.{code}"
+
+
+def _index_code_to_secid(code: str) -> str:
+    """将指数代码转换为东方财富 secid，避免把沪指/沪深300误判成深市。"""
+    return f"0.{code}" if code.startswith("399") else f"1.{code}"
+
+
+def _index_code_to_symbol(code: str) -> str:
+    """将指数代码转换为腾讯/新浪的市场前缀。"""
+    return f"sz{code}" if code.startswith("399") else f"sh{code}"
+
+
+def _stock_code_to_tushare(code: str) -> str:
+    """将股票或 ETF 代码转换为 Tushare 代码。"""
+    if code.startswith(("5", "6")):
+        return f"{code}.SH"
+    if code.startswith(("8", "4")):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
+
+
+def _is_etf_code(code: str) -> bool:
+    """识别当前项目支持的沪深 ETF 代码段。"""
+    return code.startswith(("5", "1"))
 
 
 def _get_stock_data_eastmoney_direct(stock_code: str, days: int = 5) -> Dict:
@@ -140,6 +164,106 @@ def _try_tencent_realtime(code: str) -> Dict:
                     "_source": "tencent_realtime",
                 }
     return {"error": "tencent_parse_failed"}
+
+
+def _fetch_tencent_quote(symbol: str, code: str) -> Dict:
+    """读取一条带交易所时间戳的腾讯行情，供实时展示和收盘精确回退复用。"""
+    url = f"https://qt.gtimg.cn/q={symbol}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with _NO_PROXY_OPENER.open(req, timeout=5) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+    except Exception as exc:
+        return {"error": f"tencent_quote_failed: {exc}"}
+
+    for line in raw.strip().split(";"):
+        if "~" not in line or code not in line:
+            continue
+        parts = line.split("~")
+        if len(parts) < 35:
+            continue
+        try:
+            raw_time = parts[30].strip()
+            if len(raw_time) < 14 or not raw_time[:14].isdigit():
+                return {"error": "tencent_quote_time_unreliable"}
+            source_time = datetime.strptime(raw_time[:14], "%Y%m%d%H%M%S")
+            price = float(parts[3]) if parts[3] else 0.0
+            prev_close = float(parts[4]) if parts[4] else 0.0
+            if price <= 0:
+                return {"error": "tencent_quote_price_invalid"}
+            change_pct = (
+                float(parts[32])
+                if parts[32]
+                else ((price - prev_close) / prev_close * 100 if prev_close else 0.0)
+            )
+            return {
+                "code": code,
+                "name": parts[1],
+                "date": source_time.date().isoformat(),
+                "open": float(parts[5]) if parts[5] else price,
+                "close": price,
+                "high": float(parts[33]) if parts[33] else price,
+                "low": float(parts[34]) if parts[34] else price,
+                "volume": float(parts[6]) if parts[6] else 0.0,
+                "amount": 0.0,
+                "prev_close": prev_close,
+                "change_pct": round(change_pct, 2),
+                "quote_time": source_time.isoformat(),
+                "data_as_of": source_time.isoformat(),
+                "_source": "tencent_realtime",
+            }
+        except (ValueError, IndexError) as exc:
+            return {"error": f"tencent_quote_parse_failed: {exc}"}
+    return {"error": "tencent_quote_parse_failed"}
+
+
+def _try_tencent_index_quote(index_code: str) -> Dict:
+    """获取指数当前行情；该函数可返回盘中快照，只用于实时展示。"""
+    return _fetch_tencent_quote(_index_code_to_symbol(index_code), index_code)
+
+
+def _is_final_quote_for_target(quote: Dict, target_date: str) -> bool:
+    """只有目标日 15:00 后的可靠交易所时间戳才可充当收盘数据。"""
+    if quote.get("date") != target_date:
+        return False
+    try:
+        quote_time = datetime.fromisoformat(str(quote.get("quote_time") or ""))
+    except ValueError:
+        return False
+    return quote_time.time() >= time(15, 0)
+
+
+def _try_tencent_index_on(index_code: str, target_date: str) -> Dict:
+    """目标日为今天时，以 15:00 后腾讯行情作为精确收盘回退。"""
+    if target_date != date.today().isoformat():
+        return {"error": "tencent_realtime_not_allowed_for_historical_date"}
+    quote = _try_tencent_index_quote(index_code)
+    if "error" in quote:
+        return quote
+    if not _is_final_quote_for_target(quote, target_date):
+        return {"error": "tencent_target_index_not_final"}
+    quote["_source"] = "tencent_index_final"
+    return quote
+
+
+def _try_tencent_stock_on(code: str, target_date: str) -> Dict:
+    """目标日为今天时，以 15:00 后腾讯股票/ETF 行情作为精确收盘回退。"""
+    if target_date != date.today().isoformat():
+        return {"error": "tencent_realtime_not_allowed_for_historical_date"}
+    symbol = (
+        f"bj{code}"
+        if code.startswith(("8", "4"))
+        else f"sh{code}"
+        if code.startswith(("5", "6"))
+        else f"sz{code}"
+    )
+    quote = _fetch_tencent_quote(symbol, code)
+    if "error" in quote:
+        return quote
+    if not _is_final_quote_for_target(quote, target_date):
+        return {"error": "tencent_target_stock_not_final"}
+    quote["_source"] = "tencent_stock_final"
+    return quote
 
 
 def _try_sina_realtime(code: str) -> Dict:
@@ -279,9 +403,10 @@ def _try_tushare_stock_on(code: str, target_date: str) -> Dict:
             return {"error": "TUSHARE_TOKEN未配置"}
         ts.set_token(token)
         pro = ts.pro_api()
-        suffix = ".SH" if code.startswith("6") else ".BJ" if code.startswith(("8", "4")) else ".SZ"
         compact = target_date.replace("-", "")
-        df = pro.daily(ts_code=f"{code}{suffix}", start_date=compact, end_date=compact)
+        ts_code = _stock_code_to_tushare(code)
+        query = pro.fund_daily if _is_etf_code(code) else pro.daily
+        df = query(ts_code=ts_code, start_date=compact, end_date=compact)
         if df.empty:
             return {"error": "tushare_target_date_no_data"}
         row = df.iloc[0]
@@ -296,7 +421,7 @@ def _try_tushare_stock_on(code: str, target_date: str) -> Dict:
             "volume": float(row.get("vol", 0)),
             "amount": float(row.get("amount", 0)),
             "change_pct": float(row.get("pct_chg", 0)),
-            "_source": "tushare_pro_historical",
+            "_source": "tushare_fund_historical" if _is_etf_code(code) else "tushare_pro_historical",
         }
     except Exception as exc:
         return {"error": f"tushare_historical_failed: {exc}"}
@@ -353,13 +478,22 @@ def get_stock_data_on(stock_code: str, target_date: str) -> Dict:
     if AKSHARE_AVAILABLE:
         try:
             compact = target.strftime("%Y%m%d")
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=compact,
-                end_date=compact,
-                adjust="",
-            )
+            if _is_etf_code(stock_code):
+                df = ak.fund_etf_hist_em(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=compact,
+                    end_date=compact,
+                    adjust="",
+                )
+            else:
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=compact,
+                    end_date=compact,
+                    adjust="",
+                )
             if not df.empty:
                 row = df.iloc[-1]
                 data_date = _format_trade_date(row.get("日期", ""))
@@ -374,11 +508,15 @@ def get_stock_data_on(stock_code: str, target_date: str) -> Dict:
                         "volume": float(row.get("成交量", 0)),
                         "amount": float(row.get("成交额", 0)),
                         "change_pct": float(row.get("涨跌幅", 0)),
-                        "_source": "akshare_historical",
+                        "_source": "akshare_etf_historical" if _is_etf_code(stock_code) else "akshare_historical",
                     }
         except Exception:
             pass
 
+    # 当天盘后可用带可靠时间戳的腾讯终盘价；历史日期仍严格禁止实时回退。
+    result = _try_tencent_stock_on(stock_code, target_date)
+    if "error" not in result:
+        return result
     return _try_eastmoney_stock_on(stock_code, target_date)
 
 
@@ -421,7 +559,7 @@ def _try_eastmoney_index_on(index_code: str, target_date: str) -> Dict:
     target = date.fromisoformat(target_date)
     start = (target - timedelta(days=15)).strftime("%Y%m%d")
     end = target.strftime("%Y%m%d")
-    secid = _stock_code_to_secid(index_code)
+    secid = _index_code_to_secid(index_code)
     url = (
         "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
         "fields1=f1,f2,f3,f4,f5,f6&"
@@ -488,6 +626,10 @@ def get_index_data_on(index_code: str, target_date: str) -> Dict:
                     }
         except Exception:
             pass
+    # 当天盘后可用带可靠时间戳的腾讯终盘价；历史日期仍严格禁止实时回退。
+    result = _try_tencent_index_on(index_code, target_date)
+    if "error" not in result:
+        return result
     return _try_eastmoney_index_on(index_code, target_date)
 
 
@@ -505,20 +647,13 @@ def _try_tushare_stock(code: str) -> Dict:
         ts.set_token(token)
         pro = ts.pro_api()
 
-        # 转换代码格式: 000001 → 000001.SZ, 600010 → 600010.SH
-        if code.startswith("6"):
-            ts_code = f"{code}.SH"
-        elif code.startswith(("0", "3")):
-            ts_code = f"{code}.SZ"
-        elif code.startswith(("8", "4")):
-            ts_code = f"{code}.BJ"
-        else:
-            ts_code = f"{code}.SZ"
+        ts_code = _stock_code_to_tushare(code)
 
         end_date = date.today().strftime("%Y%m%d")
         start_date = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
 
-        df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        query = pro.fund_daily if _is_etf_code(code) else pro.daily
+        df = query(ts_code=ts_code, start_date=start_date, end_date=end_date)
         if df.empty:
             return {"error": "tushare_no_data"}
 
@@ -611,7 +746,7 @@ def _get_index_data_eastmoney_direct(index_code: str = "000001") -> Dict:
     }
 
     # 尝试1: 东方财富K线
-    secid = _stock_code_to_secid(index_code)
+    secid = _index_code_to_secid(index_code)
     end_date = date.today().strftime("%Y%m%d")
     start_date = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
     url = (
@@ -642,7 +777,7 @@ def _get_index_data_eastmoney_direct(index_code: str = "000001") -> Dict:
         pass
 
     # 尝试2: 腾讯行情
-    tencent_result = _try_tencent_realtime(index_code)
+    tencent_result = _try_tencent_index_quote(index_code)
     if "error" not in tencent_result:
         tencent_result["name"] = index_names.get(index_code, f"指数{index_code}")
         return tencent_result
@@ -694,3 +829,55 @@ def get_market_overview() -> Dict:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def _build_market_overview(fetcher, target_date: str) -> Dict:
+    """并行获取三大指数，并显式报告缺失项，避免静默展示半套行情。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    index_list = [("000001", "上证指数"), ("399001", "深证成指"), ("399006", "创业板指")]
+    indices = {}
+    errors = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fetcher, code): (code, name) for code, name in index_list}
+        for future in as_completed(futures):
+            code, name = futures[future]
+            try:
+                data = future.result()
+            except Exception as exc:
+                data = {"error": str(exc)}
+            if "error" in data:
+                errors[code] = data["error"]
+                continue
+            indices[code] = {
+                "name": name,
+                "close": data.get("close", 0),
+                "prev_close": data.get("prev_close", 0),
+                "change_pct": data.get("change_pct", 0),
+                "data_as_of": data.get("data_as_of") or data.get("quote_time") or data.get("date", ""),
+                "source": data.get("_source", ""),
+            }
+    result = {"date": target_date, "indices": indices, "errors": errors}
+    if not indices:
+        result["error"] = "all_indices_unavailable"
+    return result
+
+
+def get_market_overview_on(target_date: str) -> Dict:
+    """获取指定交易日三大指数，盘后流程必须使用该精确日期接口。"""
+    try:
+        date.fromisoformat(target_date)
+    except (TypeError, ValueError):
+        return {"error": "invalid_target_date", "date": target_date, "indices": {}}
+    return _build_market_overview(
+        lambda code: get_index_data_on(code, target_date),
+        target_date,
+    )
+
+
+def get_realtime_market_overview() -> Dict:
+    """获取三大指数的当前交易所快照，仅用于只读页面展示。"""
+    now = datetime.now()
+    result = _build_market_overview(_try_tencent_index_quote, now.date().isoformat())
+    result["fetched_at"] = now.isoformat()
+    return result
