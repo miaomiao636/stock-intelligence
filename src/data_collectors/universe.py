@@ -18,6 +18,7 @@ def filter_and_rank_candidates(
     daily_basic: List[Dict],
     as_of_date: str,
     limit: int = 50,
+    max_price: float = 12.0,
 ) -> List[Dict]:
     """纯函数资格过滤；金额单位按Tushare定义换算为人民币。"""
     daily_map = {row.get("ts_code"): row for row in daily}
@@ -48,7 +49,7 @@ def filter_and_rank_candidates(
             turnover = float(valuation.get("turnover_rate") or 0)
         except (TypeError, ValueError):
             continue
-        if price <= 0 or price > 12 or abs(pct_chg) >= 9.5:
+        if price <= 0 or price > float(max_price) or abs(pct_chg) >= 9.5:
             continue
         if amount_cny < 50_000_000 or market_cap_cny < 3_000_000_000:
             continue
@@ -71,7 +72,12 @@ def filter_and_rank_candidates(
     return result[:limit]
 
 
-def _load_or_fetch(path: Path, fetcher, max_age_seconds: int = None) -> List[Dict]:
+def _load_or_fetch(
+    path: Path,
+    fetcher,
+    max_age_seconds: int = None,
+    attempts: int = 3,
+) -> List[Dict]:
     """优先使用有效缓存；接口限频时允许回退到已有旧缓存。"""
     cached = None
     if path.exists():
@@ -82,20 +88,28 @@ def _load_or_fetch(path: Path, fetcher, max_age_seconds: int = None) -> List[Dic
                 return cached
         except (OSError, json.JSONDecodeError):
             cached = None
-    try:
-        records = fetcher().to_dict("records")
-        if not records:
-            raise RuntimeError("数据源返回空记录")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(".tmp")
-        with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(records, handle, ensure_ascii=False)
-        os.replace(temp, path)
-        return records
-    except Exception:
-        if cached:
-            return cached
-        raise
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        try:
+            records = fetcher().to_dict("records")
+            if not records:
+                raise RuntimeError("数据源返回空记录")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(records, handle, ensure_ascii=False)
+            os.replace(temp, path)
+            return records
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                # Tushare低积分接口常见为1次/分钟，几秒重试只会再次失败。
+                # 两次31秒的退避可以跨过完整限频窗口；其他网络错误仍快速重试。
+                delay = 31.0 if "频率超限" in str(exc) else 1.5 * (attempt + 1)
+                time.sleep(delay)
+    if cached:
+        return cached
+    raise RuntimeError(f"{path.name}获取失败（已重试{attempts}次）：{last_error}") from last_error
 
 
 def get_ranked_candidates(
@@ -103,6 +117,7 @@ def get_ranked_candidates(
     limit: int = 50,
     cache_dir: Path = None,
     pro_client=None,
+    max_price: float = 12.0,
 ) -> List[Dict]:
     token = os.getenv("TUSHARE_TOKEN")
     if not token:
@@ -137,4 +152,11 @@ def get_ranked_candidates(
     )
     if not stocks or not daily or not daily_basic:
         raise RuntimeError(f"Tushare在{as_of_date}返回的全市场批量数据不完整")
-    return filter_and_rank_candidates(stocks, daily, daily_basic, as_of_date, limit)
+    return filter_and_rank_candidates(
+        stocks,
+        daily,
+        daily_basic,
+        as_of_date,
+        limit,
+        max_price=max_price,
+    )

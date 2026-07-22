@@ -597,7 +597,9 @@ def paper_open(date_str, if_missing):
                 for item in rejected[:4]
                 if isinstance(item, dict)
             )
-            summary = "已完成09:35重算，但没有符合¥4,000仓位和风控条件的订单。"
+            equity = result.get("account_equity")
+            equity_text = f"¥{equity:,.0f}" if isinstance(equity, (int, float)) else "当前"
+            summary = f"已完成09:35重算，但没有符合{equity_text}账户仓位和风控条件的订单。"
             if details:
                 summary += f"\n{details}"
         elif workflow_status == "disabled":

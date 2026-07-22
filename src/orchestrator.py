@@ -50,6 +50,21 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
     if not yesterday_closing:
         # bootstrap模式
         yesterday_review = None
+
+    # 策略配置必须在候选池构建前加载，价格上限同时约束全市场扫描与最终推荐。
+    try:
+        import yaml
+        strategy_file = Path(__file__).parent.parent / "config" / "strategy.yaml"
+        with open(strategy_file, encoding="utf-8") as handle:
+            strategy = yaml.safe_load(handle) or {}
+        custom_params = dict(strategy.get("custom_params", {}))
+        max_stock_price = float(custom_params.get("max_stock_price", 500) or 500)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "reason": f"策略配置加载失败: {exc}",
+            "errors": [f"策略配置加载失败: {exc}"],
+        }
     
     # 4. 采集市场数据
     try:
@@ -72,7 +87,11 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
     try:
         from src.data_collectors.universe import get_ranked_candidates
         from src.data_collectors.realtime_prices import fetch_realtime_prices
-        candidates = get_ranked_candidates(yesterday, limit=50)
+        candidates = get_ranked_candidates(
+            yesterday,
+            limit=50,
+            max_price=max_stock_price,
+        )
         market_data["candidate_universe"] = candidates
         realtime_prices = fetch_realtime_prices([item["code"] for item in candidates])
         for item in candidates:
@@ -89,8 +108,10 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
             source_status["realtime_prices"] = "empty"
             source_status["candidate_universe"] = "empty"
     except Exception as e:
-        source_status["realtime_prices"] = "error"
-        source_status["candidate_universe"] = "error"
+        # 候选池失败时仍要生成并推送研究报告，但交易门禁保持关闭。
+        candidates = []
+        source_status["realtime_prices"] = "degraded"
+        source_status["candidate_universe"] = "degraded"
         errors.append(f"全市场候选池/实时行情获取失败: {e}")
         print(f"  ⚠️  全市场候选池/实时行情获取失败: {e}")
     
@@ -114,14 +135,8 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
     # 6. 生成推荐（v0.2用LLM）
     sector_recommendations = []
     stock_recommendations = []
+    price_validation = {}
     try:
-        import yaml
-        strategy_file = Path(__file__).parent.parent / "config" / "strategy.yaml"
-        with open(strategy_file) as f:
-            strategy = yaml.safe_load(f)
-
-        custom_params = strategy.get("custom_params", {})
-
         # 注入账户资金信息，让LLM根据资金量调整推荐策略
         try:
             from src.paper_trading.trading_service import TradingService
@@ -146,16 +161,37 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
         analysis_source = llm_result.get("source", "unknown")
         llm_diagnostics = llm_result.get("diagnostics", [])
 
-        # 策略调控过滤：价格阈值
-        max_price = custom_params.get("max_stock_price", 500)
-        if max_price and max_price > 0:
-            filtered = [s for s in stock_recommendations
-                        if (s.get("current_price") or s.get("entry_price") or 999) <= max_price
-                        or s.get("action") == "watch"]
-            if len(filtered) < len(stock_recommendations):
-                removed = len(stock_recommendations) - len(filtered)
-                print(f"  💰 价格阈值¥{max_price}: 过滤掉{removed}只超价股票")
-                stock_recommendations = filtered
+        # 模型输出后再次按代码获取真实行情。模型绝对价格一律不可直接进入交易。
+        from src.analysis.price_guard import reconcile_recommendation_prices
+        from src.data_collectors.realtime_prices import fetch_realtime_prices
+
+        selected_codes = [
+            str(stock.get("code"))
+            for stock in stock_recommendations
+            if stock.get("code")
+        ]
+        verified_quotes = fetch_realtime_prices(selected_codes)
+        if verified_quotes:
+            market_data.setdefault("realtime_stock_prices", {}).update(verified_quotes)
+        price_validation = reconcile_recommendation_prices(
+            stock_recommendations,
+            verified_quotes,
+            eligible_codes=[item.get("code") for item in candidates],
+            max_price=max_stock_price,
+        )
+        validation_status = price_validation.get("status", "error")
+        source_status["recommendation_prices"] = (
+            validation_status
+            if str(validation_status).startswith("ok_")
+            else f"degraded_{validation_status}"
+        )
+        if price_validation.get("corrected"):
+            print(f"  ✅ 已按真实行情校正{price_validation['corrected']}只股票的全部价格字段")
+        if not str(validation_status).startswith("ok_"):
+            errors.append(
+                f"推荐价格仅校验{price_validation.get('verified', 0)}/"
+                f"{price_validation.get('total', 0)}只，未验证信号已禁止交易"
+            )
 
         # 策略调控过滤：周期偏好
         short_ratio = custom_params.get("short_ratio", 0.5)
@@ -197,6 +233,7 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
             "status": "failed",
             "error": str(e)[:500],
         }]
+        source_status["recommendation_prices"] = "degraded_error"
         errors.append(f"LLM调用失败，使用fallback模板: {e}")
     
     # 7. 生成报告
@@ -212,6 +249,8 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
     report["analysis_source"] = analysis_source
     report["analysis_degraded"] = source_status.get("llm") == "fallback"
     report["llm_diagnostics"] = llm_diagnostics
+    report["price_validation"] = price_validation
+    report["errors"] = list(errors)
 
     # 8. 保存报告（不覆盖已有的好数据）
     if not dry_run:

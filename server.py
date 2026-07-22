@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import os
+import math
 import logging
 import threading
 from dotenv import load_dotenv
@@ -22,6 +23,7 @@ from src.models import ApiResponse
 app = FastAPI(title="Stock Intelligence Dashboard")
 logger = logging.getLogger("stock_intelligence.feishu")
 ANALYSIS_REGEN_LOCK = threading.Lock()
+STRATEGY_CONFIG_LOCK = threading.Lock()
 
 # API Key 鉴权：读取接口可直接看盘；所有会改变状态的接口仍只接受 X-API-Key。
 API_KEY = os.getenv("API_KEY", "")
@@ -826,25 +828,53 @@ async def update_strategy_params(data: dict):
     if not config_file.exists():
         return ApiResponse.fail("Strategy config not found")
 
-    with open(config_file) as f:
-        strategy = yaml.safe_load(f)
+    def bounded_number(value, name, minimum=0.0, maximum=1.0):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{name}必须是数字")
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            raise HTTPException(status_code=400, detail=f"{name}必须在{minimum}到{maximum}之间")
+        return number
 
-    # Update factor weights
-    if "factor_weights" in data:
-        strategy.setdefault("factor_weights", {}).update(data["factor_weights"])
+    with STRATEGY_CONFIG_LOCK:
+        with open(config_file, encoding="utf-8") as f:
+            strategy = yaml.safe_load(f) or {}
 
-    # Update sector allocations
-    if "sector_allocations" in data:
-        for name, values in data["sector_allocations"].items():
-            if name in strategy.get("sector_allocations", {}):
-                strategy["sector_allocations"][name].update(values)
+        if "factor_weights" in data:
+            for name, value in (data.get("factor_weights") or {}).items():
+                strategy.setdefault("factor_weights", {})[name] = bounded_number(
+                    value, f"factor_weights.{name}"
+                )
 
-    # Update custom params (horizon ratios, market ratios, price threshold)
-    if "custom_params" in data:
-        strategy.setdefault("custom_params", {}).update(data["custom_params"])
+        if "sector_allocations" in data:
+            for name, values in (data.get("sector_allocations") or {}).items():
+                if name in strategy.get("sector_allocations", {}) and isinstance(values, dict):
+                    if "allocation" in values:
+                        values = dict(values)
+                        values["allocation"] = bounded_number(
+                            values["allocation"], f"sector_allocations.{name}.allocation"
+                        )
+                    strategy["sector_allocations"][name].update(values)
 
-    with open(config_file, "w") as f:
-        yaml.dump(strategy, f, allow_unicode=True, default_flow_style=False)
+        if "custom_params" in data:
+            allowed_ratios = {
+                "short_ratio", "medium_ratio", "long_ratio",
+                "a_share_ratio", "hk_ratio", "us_ratio",
+            }
+            for name, value in (data.get("custom_params") or {}).items():
+                if name == "max_stock_price":
+                    value = bounded_number(value, name, minimum=1.0, maximum=1000.0)
+                elif name in allowed_ratios:
+                    value = bounded_number(value, name)
+                else:
+                    raise HTTPException(status_code=400, detail=f"不支持的策略参数: {name}")
+                strategy.setdefault("custom_params", {})[name] = value
+
+        temp_file = config_file.with_suffix(".yaml.tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            yaml.safe_dump(strategy, f, allow_unicode=True, default_flow_style=False)
+        os.replace(temp_file, config_file)
 
     return {"status": "ok", "strategy": strategy}
 

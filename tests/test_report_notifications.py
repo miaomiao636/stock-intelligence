@@ -253,3 +253,16 @@ def test_ubuntu_update_preserves_env_and_installs_persistent_feishu_ws():
     assert "systemctl restart \"${SERVICE_NAME}.service\"" in script
     assert "Existing .env and data were preserved" in script
     assert "cp .env.example .env" not in script
+
+
+def test_ubuntu_cron_serializes_report_and_watchdog_with_shared_locks():
+    root = Path(__file__).resolve().parents[1]
+    cron_installer = (root / "deploy" / "install_cron_ubuntu.sh").read_text(encoding="utf-8")
+    update_script = (root / "deploy" / "update_ubuntu.sh").read_text(encoding="utf-8")
+
+    for mode in ("morning", "afternoon", "closing"):
+        lock = f"/var/lock/stock-intelligence-{mode}.lock"
+        assert cron_installer.count(lock) == 2
+    assert "/usr/bin/flock -n" in cron_installer
+    assert "/usr/bin/flock -w 1800" in cron_installer
+    assert "deploy/install_cron_ubuntu.sh" in update_script

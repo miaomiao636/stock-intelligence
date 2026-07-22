@@ -254,6 +254,7 @@
                     <button class="btn btn-primary btn-sm" id="cash-update-btn" type="button" onclick="updateAvailableCash()">修改</button>
                 </div>
                 <div class="cash-update-note">仅本次提交校验密钥，不会保存。资金变动不会计入交易收益。</div>
+                <div class="cash-update-note" id="cash-update-status" role="status"></div>
             </div>
             <div class="account-stat"><div class="label">持仓市值</div><div class="value" id="a-mv">-</div></div>
             <div class="account-stat"><div class="label">总资产</div><div class="value" id="a-total">-</div></div>
@@ -355,7 +356,7 @@
     let liveSnapshot = null;  // 只读实时行情快照，不写入交易状态
     let allRecommendations = [];  // All time periods
     let currentTimePeriod = 'all';
-    let maxStockPrice = parseInt(sessionStorage.getItem('maxStockPrice')) || 200;  // Restore from sessionStorage
+    let maxStockPrice = 200;  // 以服务器 strategy.yaml 为唯一数据源
     const PANEL_STATE_STORAGE = 'dashboardPanelStateV1';
     const DEFAULT_PANEL_STATE = { sectors:false, news:false, control:false, asset:false, trades:false, tracking:false, weekly:false, history:false };
     let panelState = {...DEFAULT_PANEL_STATE};
@@ -449,6 +450,8 @@
         const button = document.getElementById('cash-update-btn');
         const cash = Number(amountInput.value);
         const apiKey = keyInput.value.trim();
+        const statusEl = document.getElementById('cash-update-status');
+        if (statusEl) statusEl.textContent = '';
         if (!Number.isFinite(cash) || cash <= 0) {
             showToast('请输入大于 0 的可用现金金额。', 'error');
             amountInput.focus();
@@ -472,11 +475,23 @@
             if (!response.ok || !payload.success) {
                 throw new Error(payload?.message || '密钥无效或资金修改失败');
             }
+            const savedCash = Number(payload.account?.cash);
+            if (!Number.isFinite(savedCash) || Math.abs(savedCash - cash) > 0.001) {
+                throw new Error('服务器未返回已保存的资金金额，请勿按本地输入值判断成功');
+            }
             amountInput.value = '';
             showToast('可用现金已修改，收益率已自动排除本次资金变动。');
             await loadAccount();
+            if (statusEl) {
+                statusEl.textContent = `✅ 服务器已确认：可用现金 ¥${savedCash.toLocaleString()}`;
+                statusEl.style.color = '#16803c';
+            }
         } catch (error) {
             showToast(`可用现金修改失败：${error.message || error}`, 'error');
+            if (statusEl) {
+                statusEl.textContent = `❌ 未保存：${error.message || error}`;
+                statusEl.style.color = '#c62828';
+            }
         } finally {
             // 无论结果如何都清空密钥，避免它留在页面或浏览器会话中。
             keyInput.value = '';
@@ -580,7 +595,6 @@
                 const serverPrice = params.custom_params?.max_stock_price;
                 if (serverPrice && serverPrice > 0) {
                     maxStockPrice = serverPrice;
-                    sessionStorage.setItem('maxStockPrice', maxStockPrice);
                 }
             }
         } catch(e) {}
@@ -989,11 +1003,11 @@
             // 价格阈值 - use maxStockPrice (current JS value, not API value)
             h += '<div class="control-group"><h3>💰 价格阈值</h3>';
             h += `<div class="slider-row"><label>最高股价</label><input type="range" min="20" max="1000" step="10" value="${maxStockPrice}" id="max-price-slider" oninput="updatePriceThreshold(this.value)"><span class="val" id="max-price-val">¥${maxStockPrice}</span></div>`;
-            h += '<div style="font-size:12px;color:#27ae60;margin-top:4px;">✅ 价格阈值即时生效，拖动即筛选</div>';
+            h += '<div id="max-price-save-status" style="font-size:12px;color:#666;margin-top:4px;">服务器当前值；调整后请点击“保存策略配置”</div>';
             h += '</div>';
 
             h += `<div style="background:#fff8e1;border:1px solid #ffe082;border-radius:8px;padding:12px;margin-top:12px;font-size:12px;color:#e65100;">
-                <strong>⚠️ 说明：</strong>价格阈值拖动后<strong>立即生效</strong>。因子权重、板块配置等修改后需点击下方按钮保存，保存后需运行 <code>python cli.py daily --mode morning --force</code> 重新分析才能看到效果。
+                <strong>⚠️ 说明：</strong>滑块只会预览筛选效果；所有策略参数都必须点击下方按钮并看到“服务器已确认”才算保存。保存后的新参数将在下一次盘前分析生效。
             </div>`;
 
             h += `<div style="margin-top:12px;display:flex;gap:8px;"><button class="btn btn-primary" onclick="applyStrategy(this)">保存策略配置</button><button class="btn" style="background:#f5f5f5;" onclick="_controlLoaded=false;loadControlPanel()">重置</button></div>`;
@@ -1062,30 +1076,15 @@
         if (mEl) { mEl.textContent = `(总计: ${mTotal}%)`; mEl.style.color = mTotal === 100 ? '#27ae60' : '#e74c3c'; }
     }
 
-    let _savePriceTimer = null;
     function updatePriceThreshold(val) {
-        document.getElementById('max-price-val').textContent = '¥' + val;
+        document.getElementById('max-price-val').textContent = '¥' + val + '（未保存）';
         maxStockPrice = parseInt(val);
-        sessionStorage.setItem('maxStockPrice', maxStockPrice);  // Save immediately
-        renderRecommendation(); // Re-render immediately
-        // Debounce save to server (save 500ms after last change)
-        clearTimeout(_savePriceTimer);
-        _savePriceTimer = setTimeout(async () => {
-            try {
-                const apiKey = requestOperationKey('保存策略价格上限');
-                const res = await apiFetch('/api/strategy/params', {
-                    method: 'PUT', headers: {'Content-Type':'application/json'},
-                    body: JSON.stringify({ custom_params: { max_stock_price: maxStockPrice } })
-                }, apiKey);
-                if (res.ok) {
-                    document.getElementById('max-price-val').textContent = '¥' + maxStockPrice + ' ✓';
-                    setTimeout(() => {
-                        const el = document.getElementById('max-price-val');
-                        if (el) el.textContent = '¥' + maxStockPrice;
-                    }, 1500);
-                }
-            } catch(e) {}
-        }, 500);
+        renderRecommendation();
+        const status = document.getElementById('max-price-save-status');
+        if (status) {
+            status.textContent = '⚠️ 尚未保存到服务器';
+            status.style.color = '#c47700';
+        }
     }
 
     async function applyStrategy(btn) {
@@ -1111,7 +1110,6 @@
         if (priceSlider) {
             cp.max_stock_price = parseInt(priceSlider.value);
             maxStockPrice = cp.max_stock_price;  // Sync JS variable
-            sessionStorage.setItem('maxStockPrice', maxStockPrice);
         }
 
         if (!btn) btn = document.querySelector('.btn-primary');
@@ -1126,6 +1124,19 @@
                 body: JSON.stringify({ factor_weights: fw, sector_allocations: sa, custom_params: cp })
             }, apiKey);
             if (res.ok) {
+                const payload = await res.json();
+                const savedPrice = Number(payload.strategy?.custom_params?.max_stock_price);
+                if (!Number.isFinite(savedPrice) || savedPrice !== cp.max_stock_price) {
+                    throw new Error('服务器未确认价格上限，配置未保存');
+                }
+                maxStockPrice = savedPrice;
+                const priceValue = document.getElementById('max-price-val');
+                if (priceValue) priceValue.textContent = '¥' + savedPrice;
+                const saveStatus = document.getElementById('max-price-save-status');
+                if (saveStatus) {
+                    saveStatus.textContent = `✅ 服务器已确认：最高股价 ¥${savedPrice}`;
+                    saveStatus.style.color = '#16803c';
+                }
                 btn.textContent = '✅ 已保存';
                 setTimeout(() => { btn.textContent = '保存策略配置'; btn.disabled = false; }, 2000);
                 // Re-render recommendations with new price threshold

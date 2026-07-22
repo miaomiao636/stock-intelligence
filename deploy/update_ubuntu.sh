@@ -34,29 +34,12 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-echo "[2/4] Ensuring 13:15 report schedule..."
+echo "[2/4] Installing synchronized report schedule..."
 if [[ ! -f "$CRON_FILE" ]]; then
   echo "Missing $CRON_FILE; run deploy/install_ubuntu.sh first."
   exit 1
 fi
-if ! grep -q "daily --mode afternoon" "$CRON_FILE"; then
-  python3 - "$CRON_FILE" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-anchor = "55 8 * * 1-5 root cd $DIR && $PY cli.py notify --mode morning --if-missing >> /var/log/stock-intelligence-watchdog.log 2>&1\n"
-addition = (
-    "15 13 * * 1-5 root cd $DIR && $PY cli.py daily --mode afternoon >> /var/log/stock-intelligence-afternoon.log 2>&1\n"
-    "25 13 * * 1-5 root cd $DIR && $PY cli.py notify --mode afternoon --if-missing >> /var/log/stock-intelligence-watchdog.log 2>&1\n"
-)
-if anchor not in text:
-    raise SystemExit("morning cron anchor not found; refusing to rewrite unknown cron layout")
-path.write_text(text.replace(anchor, anchor + addition, 1), encoding="utf-8")
-PY
-fi
-chmod 644 "$CRON_FILE"
+PROJECT_DIR="${PROJECT_DIR}" SERVICE_NAME="${SERVICE_NAME}" /bin/bash deploy/install_cron_ubuntu.sh
 
 echo "[3/4] Restarting application services..."
 systemctl daemon-reload

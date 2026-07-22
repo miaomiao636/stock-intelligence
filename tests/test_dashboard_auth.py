@@ -81,3 +81,14 @@ def test_dashboard_uses_a_compact_collapsible_cockpit_without_storing_credential
     assert "apiKey" not in html.split("function persistPanelState", 1)[1].split(
         "function togglePanel", 1
     )[0]
+
+
+def test_dashboard_only_reports_server_confirmed_cash_and_strategy_saves():
+    html = DASHBOARD_HTML.read_text(encoding="utf-8")
+
+    assert "服务器已确认：可用现金" in html
+    assert "服务器已确认：最高股价" in html
+    assert "服务器未返回已保存的资金金额" in html
+    assert "服务器未确认价格上限" in html
+    assert "_savePriceTimer" not in html
+    assert "sessionStorage.setItem('maxStockPrice'" not in html

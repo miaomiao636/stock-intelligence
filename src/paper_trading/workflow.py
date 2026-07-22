@@ -38,9 +38,16 @@ class PaperTradingWorkflow:
             return {"status": "safe_mode", "orders": [], "reason": "LLM或数据降级，禁止开仓"}
         if not str(source_status.get("candidate_universe", "")).startswith("ok_"):
             return {"status": "safe_mode", "orders": [], "reason": "全市场候选池未通过，禁止开仓"}
+        if not str(source_status.get("recommendation_prices", "")).startswith("ok_"):
+            return {"status": "safe_mode", "orders": [], "reason": "推荐价格未全部通过真实行情校验，禁止开仓"}
+        account = self.service.get_account()
         regime = report.get("market_regime", "neutral")
         if regime in {"bearish", "high_volatility"}:
-            return {"status": "safe_mode", "orders": [], "reason": f"市场状态{regime}，¥4,000账户暂停新开仓"}
+            return {
+                "status": "safe_mode",
+                "orders": [],
+                "reason": f"市场状态{regime}，¥{account['total_equity']:,.0f}账户暂停新开仓",
+            }
         if not self.notifier.is_interactive_available():
             return {"status": "safe_mode", "orders": [], "reason": "飞书双向交互未配置"}
         callback_health = self.notifier.check_callback_reachable()
@@ -53,11 +60,13 @@ class PaperTradingWorkflow:
 
         candidates = [
             stock for stock in report.get("stock_recommendations", [])
-            if stock.get("action") == "setup_ready" and stock.get("trade_eligible", True)
+            if stock.get("action") == "setup_ready"
+            and stock.get("trade_eligible") is True
+            and stock.get("price_validation", {}).get("verified") is True
+            and float(stock.get("confidence") or 0) >= 4
         ]
         codes = [stock.get("code") for stock in candidates if stock.get("code")]
         quotes = self.quote_fetcher(codes)
-        account = self.service.get_account()
         self.service.record_equity_snapshot(account["total_equity"], at=self.service.now().isoformat())
         run_id = report.get("run_id") or f"{self.service.now().date().isoformat()}-open"
         prepared, rejected = [], []
@@ -73,7 +82,13 @@ class PaperTradingWorkflow:
             max_amount = min(account["total_equity"] * position_pct, account["cash"] - account["total_equity"] * 0.30)
             quantity = int(max_amount // (price * 100)) * 100
             if quantity < 100 or price * quantity < 1000:
-                rejected.append({"code": code, "reason": "不满足¥1,000最小订单或30%仓位限制"})
+                rejected.append({
+                    "code": code,
+                    "reason": (
+                        f"100股需¥{price * 100:,.0f}，超过当前单票可用上限¥{max_amount:,.0f}，"
+                        "或不满足¥1,000最小订单"
+                    ),
+                })
                 continue
             recommendation_id = stock.get("recommendation_id") or f"REC-{run_id}-{code}"
             stop = stock.get("stop_loss_price") or stock.get("timing", {}).get("stop_loss_price")
@@ -104,7 +119,12 @@ class PaperTradingWorkflow:
             prepared.append(order)
             if len(prepared) >= 2:
                 break
-        return {"status": "success" if prepared else "no_orders", "orders": prepared, "rejected": rejected}
+        return {
+            "status": "success" if prepared else "no_orders",
+            "orders": prepared,
+            "rejected": rejected,
+            "account_equity": account["total_equity"],
+        }
 
     def execute_due_orders(self) -> Dict:
         """确认后立即或五分钟无操作时重新取价并条件执行。"""

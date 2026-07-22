@@ -64,6 +64,8 @@ def test_0935_to_0940_workflow_requotes_and_fills(tmp_path, monkeypatch):
             "sector": "金融",
             "action": "setup_ready",
             "trade_eligible": True,
+            "confidence": 4,
+            "price_validation": {"verified": True},
             "current_price": 10,
             "stop_loss_price": 9.7,
             "target_price": 10.6,
@@ -72,7 +74,10 @@ def test_0935_to_0940_workflow_requotes_and_fills(tmp_path, monkeypatch):
         }],
     }
 
-    prepared = workflow.prepare_final_orders(report, {"llm": "success", "candidate_universe": "ok_50"})
+    prepared = workflow.prepare_final_orders(
+        report,
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_1"},
+    )
     assert prepared["status"] == "success"
     assert len(notifier.cards) == 1
     assert prepared["orders"][0]["status"] == "final_notified"
@@ -101,7 +106,7 @@ def test_unreachable_callback_never_prepares_order(tmp_path, monkeypatch):
 
     result = workflow.prepare_final_orders(
         {"stock_recommendations": []},
-        {"llm": "success", "candidate_universe": "ok_50"},
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_0"},
     )
 
     assert result["status"] == "safe_mode"
@@ -119,10 +124,11 @@ def test_high_volatility_pause_is_decided_before_callback_probe(tmp_path, monkey
         notifier=notifier,
         quote_fetcher=lambda _: (_ for _ in ()).throw(AssertionError("暂停交易时不应取行情")),
     )
+    workflow.service.initialize_account(4000)
 
     result = workflow.prepare_final_orders(
         {"market_regime": "high_volatility", "stock_recommendations": []},
-        {"llm": "success", "candidate_universe": "ok_50"},
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_0"},
     )
 
     assert result["status"] == "safe_mode"
@@ -141,6 +147,8 @@ def _tradeable_report(recommendation_id):
             "sector": "金融",
             "action": "setup_ready",
             "trade_eligible": True,
+            "confidence": 4,
+            "price_validation": {"verified": True},
             "stop_loss_price": 9.7,
             "target_price": 10.6,
             "horizon": "short",
@@ -176,7 +184,7 @@ def test_due_order_is_rejected_when_callback_becomes_unreachable(tmp_path, monke
     workflow.service.initialize_account(4000)
     prepared = workflow.prepare_final_orders(
         _tradeable_report("REC-OFFLINE"),
-        {"llm": "success", "candidate_universe": "ok_50"},
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_1"},
     )
     order_id = prepared["orders"][0]["order_id"]
 
@@ -203,7 +211,7 @@ def test_confirmed_order_executes_without_second_callback_probe(tmp_path, monkey
     workflow.service.initialize_account(4000)
     prepared = workflow.prepare_final_orders(
         _tradeable_report("REC-CONFIRMED"),
-        {"llm": "success", "candidate_universe": "ok_50"},
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_1"},
     )
     order_id = prepared["orders"][0]["order_id"]
     workflow.service.record_decision(order_id, "confirm")

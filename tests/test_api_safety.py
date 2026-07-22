@@ -2,6 +2,7 @@
 """API写入口和飞书回调的安全门禁。"""
 
 from fastapi.testclient import TestClient
+import yaml
 
 import server
 
@@ -185,3 +186,34 @@ def test_latest_quote_does_not_rewrite_historical_signal(monkeypatch):
     assert stock["target_price"] == 10.2
     assert stock["stop_loss_price"] == 9.4
     assert stock["latest_price"] == 10.5
+
+
+def test_strategy_update_is_authenticated_validated_and_persisted(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    strategy_file = config_dir / "strategy.yaml"
+    strategy_file.write_text(
+        yaml.safe_dump({"custom_params": {"max_stock_price": 20}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(server, "API_KEY", "test-key")
+    client = TestClient(server.app)
+
+    denied = client.put("/api/strategy/params", json={"custom_params": {"max_stock_price": 50}})
+    saved = client.put(
+        "/api/strategy/params",
+        json={"custom_params": {"max_stock_price": 50}},
+        headers={"X-API-Key": "test-key"},
+    )
+    invalid = client.put(
+        "/api/strategy/params",
+        json={"custom_params": {"max_stock_price": 5001}},
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert denied.status_code == 401
+    assert saved.status_code == 200
+    assert saved.json()["strategy"]["custom_params"]["max_stock_price"] == 50
+    assert yaml.safe_load(strategy_file.read_text(encoding="utf-8"))["custom_params"]["max_stock_price"] == 50
+    assert invalid.status_code == 400
