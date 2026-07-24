@@ -9,9 +9,10 @@ import json
 import logging
 import os
 import signal
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from dotenv import load_dotenv
 
@@ -174,17 +175,51 @@ def card_event_to_payload(event: Any) -> Dict:
 class FeishuLongConnection:
     """在独立进程中维护飞书长连接并复用现有交易决策逻辑。"""
 
-    def __init__(self, *, status_path: Optional[Path] = None, notifier=None):
+    def __init__(
+        self,
+        *,
+        status_path: Optional[Path] = None,
+        notifier=None,
+        action_processor: Callable = process_card_action,
+        execute_confirm: Optional[Callable[[], Dict]] = None,
+        node_id: Optional[str] = None,
+    ):
         self.status_path = _status_path(status_path)
         self.notifier = notifier or FeishuNotifier()
+        self.action_processor = action_processor
+        self.execute_confirm = execute_confirm or self._execute_due_orders
+        self.node_id = (
+            node_id
+            or os.getenv("FEISHU_CALLBACK_NODE_ID", "").strip()
+            or socket.gethostname()
+        )
         self.stop_event = asyncio.Event()
-        self.status: Dict = {"pid": os.getpid(), "state": "starting", "ready": False}
+        self.background_tasks: set[asyncio.Task] = set()
+        self.status: Dict = {
+            "pid": os.getpid(),
+            "node_id": self.node_id,
+            "state": "starting",
+            "ready": False,
+        }
+
+    @staticmethod
+    def _execute_due_orders() -> Dict:
+        from src.paper_trading.workflow import PaperTradingWorkflow
+
+        return PaperTradingWorkflow().execute_due_orders()
 
     def update_status(self, **changes) -> None:
         self.status.update(changes)
         self.status["pid"] = os.getpid()
+        self.status["node_id"] = self.node_id
         self.status["heartbeat_at"] = _utc_now().isoformat()
         _write_status(self.status_path, self.status)
+
+    def schedule_background(self, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
 
     async def notify_result(self, title: str, content: str) -> None:
         try:
@@ -192,25 +227,63 @@ class FeishuLongConnection:
         except Exception as exc:  # pragma: no cover - 仅记录错误类型，不写原始响应
             logger.warning("feishu_ws result_notification_failed error=%s", type(exc).__name__)
 
+    async def execute_confirm_background(self, order_id: str) -> None:
+        try:
+            await asyncio.to_thread(self.execute_confirm)
+            self.update_status(
+                last_execution_at=_utc_now().isoformat(),
+                last_execution_error=None,
+            )
+        except Exception as exc:  # pragma: no cover - 真实行情与网络异常
+            self.update_status(last_execution_error=type(exc).__name__)
+            await self.notify_result(
+                "模拟订单执行失败",
+                (
+                    f"订单：{order_id}\n"
+                    f"原因：{type(exc).__name__}\n"
+                    f"处理节点：{self.node_id}"
+                ),
+            )
+            logger.exception(
+                "feishu_ws execution_failed node_id=%s error=%s",
+                self.node_id,
+                type(exc).__name__,
+            )
+
     async def handle_card_action(self, event: Any) -> None:
         payload = card_event_to_payload(event)
         action = self.notifier.parse_card_action(payload)
         action_name = action.get("action")
         logger.info(
-            "feishu_ws action=%s has_order_id=%s has_event_id=%s",
+            "feishu_ws node_id=%s action=%s has_order_id=%s has_event_id=%s",
+            self.node_id,
             action_name if action_name in ALLOWED_TRADE_ACTIONS | {"ping"} else "unknown",
             bool(action.get("order_id")),
             bool(action.get("event_id")),
         )
         try:
-            result = await asyncio.to_thread(process_card_action, action)
+            result = await asyncio.to_thread(
+                self.action_processor,
+                action,
+                execute_confirm=lambda: {"status": "queued"},
+            )
         except Exception as exc:
             self.update_status(last_event_error=type(exc).__name__)
-            await self.notify_result(
-                "模拟订单操作失败",
-                f"订单：{action.get('order_id') or '未识别'}\n原因：{type(exc).__name__}",
+            self.schedule_background(
+                self.notify_result(
+                    "模拟订单操作失败",
+                    (
+                        f"订单：{action.get('order_id') or '未识别'}\n"
+                        f"原因：{type(exc).__name__}\n"
+                        f"处理节点：{self.node_id}"
+                    ),
+                )
             )
-            logger.exception("feishu_ws action_failed error=%s", type(exc).__name__)
+            logger.exception(
+                "feishu_ws action_failed node_id=%s error=%s",
+                self.node_id,
+                type(exc).__name__,
+            )
             return
 
         self.update_status(
@@ -219,12 +292,35 @@ class FeishuLongConnection:
             last_event_error=None,
         )
         toast = result.get("toast", {})
+        execution = result.get("execution") or {}
+        if (
+            action_name == "confirm"
+            and toast.get("type") == "success"
+            and execution.get("status") == "queued"
+        ):
+            self.schedule_background(
+                self.execute_confirm_background(action.get("order_id") or "未识别")
+            )
         if action_name == "ping":
-            await self.notify_result("飞书长连接自检", toast.get("content") or "飞书回调链路正常")
+            self.schedule_background(
+                self.notify_result(
+                    "飞书长连接自检",
+                    (
+                        f"{toast.get('content') or '飞书回调链路正常'}\n"
+                        f"处理节点：{self.node_id}"
+                    ),
+                )
+            )
         elif action_name in ALLOWED_TRADE_ACTIONS:
-            await self.notify_result(
-                "模拟订单操作结果",
-                f"订单：{action.get('order_id')}\n{toast.get('content') or '操作已处理'}",
+            self.schedule_background(
+                self.notify_result(
+                    "模拟订单操作结果",
+                    (
+                        f"订单：{action.get('order_id')}\n"
+                        f"{toast.get('content') or '操作已处理'}\n"
+                        f"处理节点：{self.node_id}"
+                    ),
+                )
             )
 
     async def run(self) -> None:

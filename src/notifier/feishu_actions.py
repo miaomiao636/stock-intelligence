@@ -33,12 +33,18 @@ def process_card_action(
         from src.paper_trading.trading_service import TradingService
 
         service = TradingService()
-    order = service.record_decision(
-        action["order_id"],
-        action_name,
-        actor=action.get("actor") or "feishu_user",
-        event_id=action.get("event_id"),
-    )
+    try:
+        order = service.record_decision(
+            action["order_id"],
+            action_name,
+            actor=action.get("actor") or "feishu_user",
+            event_id=action.get("event_id"),
+        )
+    except ValueError as exc:
+        return {
+            "toast": {"type": "warning", "content": f"操作未执行：{exc}"},
+            "execution": None,
+        }
 
     execution = None
     if action_name == "confirm":

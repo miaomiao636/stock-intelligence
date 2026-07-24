@@ -42,6 +42,34 @@ def test_ping_and_unknown_actions_do_not_touch_trading_service():
     assert service.calls == []
 
 
+def test_terminal_order_click_returns_business_reason_without_executing():
+    class TerminalOrderService:
+        @staticmethod
+        def record_decision(order_id, action, actor, event_id):
+            raise ValueError("订单状态不允许此操作: filled")
+
+    executions = []
+    result = process_card_action(
+        {
+            "action": "confirm",
+            "order_id": "order-filled",
+            "actor": "ou-test",
+            "event_id": "evt-terminal",
+        },
+        service=TerminalOrderService(),
+        execute_confirm=lambda: executions.append("run"),
+    )
+
+    assert result == {
+        "toast": {
+            "type": "warning",
+            "content": "操作未执行：订单状态不允许此操作: filled",
+        },
+        "execution": None,
+    }
+    assert executions == []
+
+
 def test_sdk_card_event_is_converted_with_stable_event_id():
     event = SimpleNamespace(
         message_id="om-1",
