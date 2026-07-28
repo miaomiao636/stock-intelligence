@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""09:35最终计划、09:40条件执行和盘中监控编排。"""
+"""09:35自动执行、订单恢复扫描和盘中监控编排。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class PaperTradingWorkflow:
         return os.getenv("PAPER_TRADING_ENABLED", "false").lower() == "true"
 
     def prepare_final_orders(self, report: Dict, source_status: Dict = None) -> Dict:
-        """用09:35行情重算并发送最终交互卡片。"""
+        """用09:35行情重算，通过风控后立即模拟成交并推送结果。"""
         if not self.enabled():
             return {"status": "disabled", "orders": [], "reason": "PAPER_TRADING_ENABLED=false"}
         source_status = source_status or {}
@@ -48,16 +48,6 @@ class PaperTradingWorkflow:
                 "orders": [],
                 "reason": f"市场状态{regime}，¥{account['total_equity']:,.0f}账户暂停新开仓",
             }
-        if not self.notifier.is_interactive_available():
-            return {"status": "safe_mode", "orders": [], "reason": "飞书双向交互未配置"}
-        callback_health = self.notifier.check_callback_reachable()
-        if not callback_health.get("reachable"):
-            return {
-                "status": "safe_mode",
-                "orders": [],
-                "reason": f"飞书回调不可用，禁止生成自动订单：{callback_health.get('reason') or '未知原因'}",
-            }
-
         candidates = [
             stock for stock in report.get("stock_recommendations", [])
             if stock.get("action") == "setup_ready"
@@ -69,7 +59,7 @@ class PaperTradingWorkflow:
         quotes = self.quote_fetcher(codes)
         self.service.record_equity_snapshot(account["total_equity"], at=self.service.now().isoformat())
         run_id = report.get("run_id") or f"{self.service.now().date().isoformat()}-open"
-        prepared, rejected = [], []
+        prepared, rejected, execution_results, notification_results = [], [], [], []
 
         for stock in candidates[:4]:
             code = stock.get("code")
@@ -110,24 +100,60 @@ class PaperTradingWorkflow:
                 horizon=stock.get("horizon", "short"),
                 reason=stock.get("reason", ""),
             )
-            order = self.service.mark_final_notified(order["order_id"], veto_minutes=5)
-            send_result = self.notifier.send_trade_plan(order)
-            if send_result.get("status") != "success":
-                self.service.reject_uncertain_callback(order["order_id"], "飞书最终计划发送失败")
-                rejected.append({"code": code, "reason": send_result.get("message")})
+            if order["status"] in {"proposed", "pre_notified"}:
+                order = self.service.confirm_automatically(order["order_id"])
+            if order["status"] == "filled":
+                trade = self.service.ledger.get_trade_by_order(order["order_id"])
+                result = {"success": True, "order": order, "trade": trade, "idempotent_replay": True}
+            elif order["status"] == "confirmed":
+                result = self.service.execute_ready_order(order["order_id"], quote)
+            else:
+                result = {"success": False, "order": order, "error": f"订单状态不可自动执行: {order['status']}"}
+            execution_results.append(result)
+            final = result.get("order") or self.service.get_order(order["order_id"])
+            status = final.get("status") if final else "unknown"
+            if result.get("success") and result.get("trade"):
+                trade = result["trade"]
+                detail = f"成交价¥{trade['price']:.4f}，数量{trade['quantity']}股，费用¥{trade['fees']:.2f}"
+                title = "模拟订单已自动成交"
+            else:
+                detail = result.get("error") or "自动执行失败"
+                title = "模拟订单自动执行失败"
+                rejected.append({"code": code, "reason": detail})
+            notification_results.append(
+                self.notifier.send_message(
+                    title,
+                    f"{order['name']}（{order['code']}）\n状态：{status}\n{detail}",
+                )
+            )
+            if not result.get("success"):
                 continue
-            prepared.append(order)
+            prepared.append(final)
             if len(prepared) >= 2:
                 break
+        failed_notifications = [
+            item for item in notification_results if item.get("status") != "success"
+        ]
         return {
             "status": "success" if prepared else "no_orders",
             "orders": prepared,
             "rejected": rejected,
+            "execution_results": execution_results,
+            "notification_result": (
+                {
+                    "status": "error",
+                    "message": failed_notifications[0].get("message")
+                    or failed_notifications[0].get("reason")
+                    or "自动成交结果未送达飞书",
+                }
+                if failed_notifications
+                else {"status": "success", "data": {}}
+            ),
             "account_equity": account["total_equity"],
         }
 
     def execute_due_orders(self) -> Dict:
-        """确认后立即或五分钟无操作时重新取价并条件执行。"""
+        """恢复扫描：执行已自动确认或遗留确认窗口到期的订单。"""
         if not self.enabled():
             return {"status": "disabled", "results": []}
         candidates = self.service.ledger.list_orders(
@@ -231,13 +257,20 @@ class PaperTradingWorkflow:
                         idempotency_key=f"exit:{self.service.now().date().isoformat()}:{position['code']}:{reason}",
                     )
                     if order["status"] == "proposed":
-                        order = self.service.mark_final_notified(order["order_id"], veto_minutes=5)
-                        sent = self.notifier.send_trade_plan(order)
-                        if sent.get("status") != "success":
-                            self.service.reject_uncertain_callback(order["order_id"], "飞书退出计划发送失败")
-                            alerts.append(f"{position['name']} {reason}，但飞书发送失败，已安全取消")
+                        order = self.service.confirm_automatically(order["order_id"])
+                        result = self.service.execute_ready_order(order["order_id"], quotes[position["code"]])
+                        final = result.get("order") or self.service.get_order(order["order_id"])
+                        if result.get("success") and result.get("trade"):
+                            trade = result["trade"]
+                            alerts.append(
+                                f"{position['name']} {reason}，已自动卖出{trade['quantity']}股，"
+                                f"成交价¥{trade['price']:.4f}，费用¥{trade['fees']:.2f}"
+                            )
                         else:
-                            alerts.append(f"{position['name']} {reason}，卖出计划已进入飞书5分钟窗口")
+                            alerts.append(
+                                f"{position['name']} {reason}，自动卖出失败："
+                                f"{result.get('error') or (final or {}).get('reject_reason') or '未知原因'}"
+                            )
         if alerts:
             self.notifier.send_message("盘中风险变化", "\n".join(f"- {a}" for a in alerts))
         return {"status": "success", "positions": len(positions), "alerts": alerts, "metrics": metrics}

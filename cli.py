@@ -540,7 +540,7 @@ def init(cash):
 @click.option("--date", "date_str", help="交易日 YYYY-MM-DD")
 @click.option("--if-missing", is_flag=True, help="仅在没有成功状态回执时补跑")
 def paper_open(date_str, if_missing):
-    """09:35重新取价，生成并发送最终交易卡片。"""
+    """09:35重新取价，通过风控后自动成交并推送结果。"""
     from src.analysis.recovery import recover_degraded_morning_report
     from src.notifier.feishu import FeishuNotifier
     from src.notifier.paper_delivery import has_successful_delivery, record_delivery
@@ -585,8 +585,9 @@ def paper_open(date_str, if_missing):
     workflow_status = result.get("status", "error")
     source = "watchdog" if if_missing else "scheduled"
     if workflow_status == "success":
-        # success只会在交易卡片已经发送成功后返回，避免额外重复消息。
-        notify_result = {"status": "success", "data": {}}
+        # 自动成交与飞书通知分开执行；通知失败时不能把阶段回执误记成功，
+        # 09:45补跑会利用订单幂等键重新发送最终成交结果。
+        notify_result = result.get("notification_result") or {"status": "success", "data": {}}
     else:
         if workflow_status == "safe_mode":
             summary = f"今日安全暂停新开仓。\n原因：{result.get('reason') or '风控条件未通过'}"

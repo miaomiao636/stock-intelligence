@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""半自动模拟交易闭环的行为规格。"""
+"""自动模拟交易闭环及历史人工确认兼容行为规格。"""
 
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +72,18 @@ def test_confirm_revalidates_and_fills_with_costs(service, open_time):
     replay = service.execute_ready_order(order["order_id"], quote("000001", 10.02, open_time))
     assert replay["success"] is False
     assert service.get_order(order["order_id"])["status"] == "filled"
+
+
+def test_system_auto_confirmation_has_no_waiting_window(service, open_time):
+    order = proposed_buy(service)
+
+    confirmed = service.confirm_automatically(order["order_id"])
+    result = service.execute_ready_order(order["order_id"], quote("000001", 10.0, open_time))
+
+    assert confirmed["status"] == "confirmed"
+    assert confirmed["decision"] == "auto_execute"
+    assert confirmed["decision_actor"] == "system_auto"
+    assert result["success"] is True
 
 
 def test_no_action_becomes_executable_only_after_five_minutes(service, open_time):

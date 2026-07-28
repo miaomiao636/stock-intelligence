@@ -27,11 +27,11 @@ DIR=/Users/Admin/github-ai-tools/stock-intelligence
 # 13:25检查成功回执，避免分析成功但飞书漏推
 25 13 * * 1-5 cd $DIR && $PY cli.py notify --mode afternoon --if-missing >> /tmp/stock-intelligence-notify-watchdog.log 2>&1
 
-# 09:35重新取价并发送最终计划；09:40执行无否决且仍通过风控的订单
+# 09:35重新取价并在风控通过后直接自动执行，成交结果推送飞书
 35 9 * * 1-5 cd $DIR && $PY cli.py paper open >> /tmp/stock-intelligence-open.log 2>&1
 # 09:45检查阶段回执；09:35中断或状态消息未送达时自动补跑一次。
 45 9 * * 1-5 cd $DIR && $PY cli.py paper open --if-missing >> /tmp/stock-intelligence-open-watchdog.log 2>&1
-# 仅扫描待执行订单；没有到期/已确认订单时不请求行情、不发消息。
+# 恢复扫描：仅处理自动确认后因进程中断尚未成交的订单及历史遗留订单。
 * 9-14 * * 1-5 cd $DIR && $PY cli.py paper execute-due >> /tmp/stock-intelligence-execute.log 2>&1
 0 15 * * 1-5 cd $DIR && $PY cli.py paper execute-due >> /tmp/stock-intelligence-execute.log 2>&1
 

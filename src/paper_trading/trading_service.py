@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""安全的半自动模拟交易服务。"""
+"""安全的自动模拟交易服务。"""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ TERMINAL_STATUSES = {"filled", "rejected", "cancelled_by_user", "paused_for_day"
 class TradingService:
     """所有模拟成交的唯一入口。
 
-    订单必须先 proposed，再 final_notified，之后由明确确认或五分钟无操作进入
-    revalidating。任何行情、回调或账本状态不确定都安全拒绝。
+    新订单可以由唯一执行节点自动确认后进入 revalidating；历史交互订单仍兼容
+    final_notified/confirmed 状态。任何行情或账本状态不确定都安全拒绝。
     """
 
     def __init__(self, data_dir: Path = None, now_provider: Callable[[], datetime] = None):
@@ -116,6 +116,28 @@ class TradingService:
             self.now(),
             notified_at=notified_at.isoformat(),
             veto_deadline=deadline.isoformat(),
+        )
+
+    def confirm_automatically(self, order_id: str, actor: str = "system_auto") -> Dict:
+        """将新订单标记为系统自动确认，不创建人工确认窗口。"""
+        order = self._require_status(order_id, {"proposed", "pre_notified", "confirmed"})
+        if order["status"] == "confirmed":
+            return order
+        now = self.now()
+        event_id = hashlib.sha256(f"{order_id}:auto_execute:{actor}".encode()).hexdigest()
+        # 决策写入和订单状态更新分属两个短事务。即使进程恰好在两者之间
+        # 中断，重跑时也必须继续把订单推进到 confirmed，而不能永久卡住。
+        self.ledger.record_decision(order_id, "auto_execute", actor, now, event_id)
+        current = self.get_order(order_id)
+        if current and current["status"] == "confirmed":
+            return current
+        return self.ledger.update_order(
+            order_id,
+            "confirmed",
+            now,
+            decision="auto_execute",
+            decision_actor=actor,
+            decided_at=now.isoformat(),
         )
 
     def record_decision(
