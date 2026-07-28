@@ -48,6 +48,10 @@ def test_dashboard_uses_sqlite_performance_and_trade_shapes():
     html = DASHBOARD_HTML.read_text(encoding="utf-8")
 
     assert "apiFetch('/api/performance')" in html
+    assert 'id="a-initial"' not in html
+    assert "getElementById('a-initial')" not in html
+    assert "可用现金（可修改）" in html
+    assert "d.effective_principal ?? d.adjusted_principal ?? d.initial_cash" in html
     assert "扣费后总收益" in html
     assert "最大回撤" in html
     assert "Number(t.fees||0)" in html

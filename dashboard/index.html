@@ -245,7 +245,6 @@
 
         <!-- Account banner -->
         <div class="account-banner" id="account-banner">
-            <div class="account-stat"><div class="label">初始资金</div><div class="value" id="a-initial">-</div></div>
             <div class="account-stat">
                 <div class="label">可用现金（可修改）</div><div class="value" id="a-cash">-</div>
                 <div class="cash-update">
@@ -677,10 +676,10 @@
             }
             if (cachedAccount.error) return;
             const d = cachedAccount;
-            const ret = Number(d.net_return_after_costs ?? (d.total_equity - d.initial_cash));
-            const pct = Number(d.net_return_after_costs_pct ?? (d.initial_cash > 0 ? (ret / d.initial_cash * 100) : 0));
+            const principal = Number(d.effective_principal ?? d.adjusted_principal ?? d.initial_cash ?? 0);
+            const ret = Number(d.net_return_after_costs ?? (d.total_equity - principal));
+            const pct = Number(d.net_return_after_costs_pct ?? (principal > 0 ? (ret / principal * 100) : 0));
             const cls = ret >= 0 ? 'positive' : 'negative';
-            document.getElementById('a-initial').textContent = '¥' + (d.initial_cash||0).toLocaleString();
             document.getElementById('a-cash').textContent = '¥' + (d.cash||0).toLocaleString();
             document.getElementById('a-mv').textContent = '¥' + (d.market_value||0).toLocaleString();
             document.getElementById('a-total').textContent = '¥' + (d.total_equity||0).toLocaleString();

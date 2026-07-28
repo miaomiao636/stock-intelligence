@@ -883,37 +883,127 @@ async def update_strategy_params(data: dict):
 @app.get("/api/analysis/asset")
 def get_asset_analysis():
     from src.paper_trading.trading_service import TradingService
+
     service = TradingService()
     account = service.get_account()
     snapshots = service.ledger.snapshots()
+    adjustments = service.ledger.cash_adjustments()
+    timezone = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(timezone)
+
+    def parse_timestamp(value):
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone)
+        return parsed.astimezone(timezone)
+
+    adjustment_rows = sorted(
+        (
+            (parse_timestamp(row["created_at"]), float(row["amount"]))
+            for row in adjustments
+        ),
+        key=lambda item: item[0],
+    )
+    initial_cash = float(account["initial_cash"])
+
+    def principal_at(cutoff):
+        return initial_cash + sum(
+            amount for created_at, amount in adjustment_rows if created_at <= cutoff
+        )
+
+    def cash_flow_between(start, end):
+        return sum(
+            amount
+            for created_at, amount in adjustment_rows
+            if (start is None or created_at > start) and created_at <= end
+        )
+
     by_day = {}
     for snapshot in snapshots:
-        by_day[snapshot["captured_at"][:10]] = float(snapshot["total_equity"])
-    by_day[date.today().isoformat()] = account["total_equity"]
+        captured_at = parse_timestamp(snapshot["captured_at"])
+        day = captured_at.date().isoformat()
+        existing = by_day.get(day)
+        if existing is None or captured_at > existing["captured_at"]:
+            by_day[day] = {
+                "captured_at": captured_at,
+                "total_equity": float(snapshot["total_equity"]),
+            }
+    by_day[now.date().isoformat()] = {
+        "captured_at": now,
+        "total_equity": float(account["total_equity"]),
+    }
+
     daily = []
-    for day, equity in sorted(by_day.items()):
+    previous_equity = None
+    previous_at = None
+    for day, point in sorted(by_day.items()):
+        captured_at = point["captured_at"]
+        equity = point["total_equity"]
+        effective_principal = principal_at(captured_at)
+        if previous_equity is None:
+            opening_equity = effective_principal
+            external_cash_flow = 0.0
+            invested_capital = effective_principal
+            period_profit = equity - effective_principal
+        else:
+            opening_equity = previous_equity
+            external_cash_flow = cash_flow_between(previous_at, captured_at)
+            invested_capital = opening_equity + external_cash_flow
+            period_profit = equity - invested_capital
+        return_pct = (
+            period_profit / invested_capital * 100 if invested_capital else 0.0
+        )
+        total_return = equity - effective_principal
         daily.append({
             "date": day,
             "total_equity": equity,
-            "total_return": round(equity - account["initial_cash"], 2),
-            "total_return_pct": round((equity / account["initial_cash"] - 1) * 100, 4),
+            "opening_equity": round(opening_equity, 2),
+            "invested_capital": round(invested_capital, 2),
+            "external_cash_flow": round(external_cash_flow, 2),
+            "effective_principal": round(effective_principal, 2),
+            "return_pct": round(return_pct, 4),
+            "total_return": round(total_return, 2),
+            "total_return_pct": round(
+                total_return / effective_principal * 100, 4
+            ) if effective_principal else 0.0,
             "positions_count": len(service.get_positions(day)),
         })
+        previous_equity = equity
+        previous_at = captured_at
+
     def aggregate(key_fn):
         groups = {}
         for row in daily:
             groups.setdefault(key_fn(row["date"]), []).append(row)
-        return [{
-            "period": key,
-            "start_equity": rows[0]["total_equity"],
-            "end_equity": rows[-1]["total_equity"],
-            "return_pct": round((rows[-1]["total_equity"] / rows[0]["total_equity"] - 1) * 100, 4),
-        } for key, rows in sorted(groups.items())]
+        aggregated = []
+        for key, rows in sorted(groups.items()):
+            external_cash_flow = sum(
+                float(row["external_cash_flow"]) for row in rows
+            )
+            invested_capital = rows[0]["opening_equity"] + external_cash_flow
+            period_profit = (
+                rows[-1]["total_equity"]
+                - rows[0]["opening_equity"]
+                - external_cash_flow
+            )
+            aggregated.append({
+                "period": key,
+                "start_equity": rows[0]["opening_equity"],
+                "end_equity": rows[-1]["total_equity"],
+                "external_cash_flow": round(external_cash_flow, 2),
+                "return_pct": round(
+                    period_profit / invested_capital * 100, 4
+                ) if invested_capital else 0.0,
+            })
+        return aggregated
+
     return {
-        "initial_cash": account["initial_cash"],
+        "initial_cash": initial_cash,
+        "effective_principal": daily[-1]["effective_principal"],
         "current_equity": daily[-1]["total_equity"],
         "total_return": daily[-1]["total_return"],
         "total_return_pct": daily[-1]["total_return_pct"],
+        "cash_flow_adjusted": True,
         "max_drawdown_pct": service.get_performance_metrics()["max_drawdown_pct"],
         "daily": daily,
         "weekly": aggregate(lambda d: f"{datetime.fromisoformat(d).isocalendar()[0]}-W{datetime.fromisoformat(d).isocalendar()[1]:02d}"),
