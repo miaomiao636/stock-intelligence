@@ -148,13 +148,16 @@ async def update_account(data: AccountUpdate):
 
 # API: 重置账户（危险操作）
 @app.post("/api/account/reset")
-async def reset_account(confirm: bool = False, initial_cash: float = 4000):
+async def reset_account(confirm: bool = False, initial_cash: Optional[float] = None):
     """重置整个账户（归档旧数据，创建新账户）"""
     if not confirm:
         return ApiResponse.fail("需要确认：此操作将归档所有数据并创建新账户，添加 ?confirm=true 确认")
 
-    if initial_cash != 4000:
-        return ApiResponse.fail("当前正式模拟账户初始资金固定为¥4,000")
+    from src.strategy.position_limits import get_initial_cash
+    configured_cash = get_initial_cash()
+    initial_cash = configured_cash if initial_cash is None else float(initial_cash)
+    if initial_cash != configured_cash:
+        return ApiResponse.fail(f"当前正式模拟账户初始资金固定为¥{configured_cash:,.0f}")
     import shutil
     from src.paper_trading.trading_service import TradingService
     archive_dir = DATA_DIR / "archive" / f"reset_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -162,7 +165,7 @@ async def reset_account(confirm: bool = False, initial_cash: float = 4000):
     db_file = DATA_DIR / "stock_intelligence.db"
     if db_file.exists():
         shutil.copy2(db_file, archive_dir / "stock_intelligence.db")
-    result = TradingService().initialize_account(4000, reset=True)
+    result = TradingService().initialize_account(configured_cash, reset=True)
     return {"success": True, "archive_dir": str(archive_dir), "account": result}
 
 

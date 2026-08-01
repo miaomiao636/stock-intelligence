@@ -177,7 +177,7 @@ class TestPositionLimits:
         from src.strategy.position_limits import get_initial_cash
         cash = get_initial_cash()
         assert cash > 0, "初始资金应大于0"
-        assert cash == 4000, "默认模拟资金应为4000"
+        assert cash == 20000, "默认模拟资金应为20000"
 
     def test_tier_boundary_is_inclusive(self):
         """恰好位于分档上限时仍属于当前档。"""

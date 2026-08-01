@@ -26,7 +26,7 @@ def _quote(code: str, price: float, now: datetime) -> dict:
 def test_trading_service_buy_is_idempotent_and_sell_is_t_plus_one(tmp_path):
     clock = {"now": datetime(2026, 7, 13, 9, 35, tzinfo=TZ)}
     service = TradingService(tmp_path, now_provider=lambda: clock["now"])
-    service.initialize_account(4000)
+    service.initialize_account(20000)
 
     buy = service.propose_order(
         run_id="2026-07-13-open",

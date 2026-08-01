@@ -2,42 +2,122 @@ custom_params:
   a_share_ratio: 0.95
   hk_ratio: 0.03
   long_ratio: 0.05
-  max_stock_price: 20
+  max_stock_price: 50
   medium_ratio: 0.2
   short_ratio: 0.75
   us_ratio: 0.02
 factor_weights:
-  technical_pattern: 0.15   # 降权：减少追高倾向（原0.25）
-  capital_flow: 0.15        # 微调降权以保持总和=1.0（原0.20）
-  sector_momentum: 0.15     # 保持：板块趋势
-  news_sentiment: 0.15      # 升权：要求基本面催化（原0.10）
-  policy_signal: 0.15       # 升权：成功股政策维度强（原0.10）
-  volume_confirmation: 0.10 # 保持：量能确认
-  global_linkage: 0.05      # 保持：外围联动
-  risk_penalty: 0.10        # 升权：过滤异常止损（原0.05）
+  capital_flow: 0.15
+  global_linkage: 0.05
+  news_sentiment: 0.15
+  policy_signal: 0.15
+  risk_penalty: 0.1
+  sector_momentum: 0.15
+  technical_pattern: 0.15
+  volume_confirmation: 0.1
+initial_cash: 20000
+paper_trading:
+  cash_reserve_pct: 0.2
+  daily_loss_limit_pct: 0.015
+  enabled: false
+  intraday_interval_minutes: 30
+  max_drawdown_pause_pct: 0.1
+  max_candidates_to_scan: 10
+  max_daily_new_risk_pct: 0.015
+  max_new_positions_per_day: 2
+  max_position_pct: 0.3
+  max_positions: 5
+  max_total_exposure_pct: 0.8
+  max_trade_risk_pct: 0.0075
+  min_order_amount: 1000
+  min_trade_confidence: 4
+  mode: auto
+  quote_max_age_seconds: 60
+  reentry_cooldown_trading_days: 2
+  same_sector_max_positions: 2
+  veto_minutes: 0
+  regime_limits:
+    bearish:
+      allow_etfs: true
+      allow_stocks: false
+      max_new_positions_per_day: 1
+      max_position_pct: 0.15
+      max_total_exposure_pct: 0.15
+    bullish:
+      allow_etfs: true
+      allow_stocks: true
+      max_new_positions_per_day: 2
+      max_position_pct: 0.3
+      max_total_exposure_pct: 0.8
+    high_volatility:
+      allow_etfs: true
+      allow_stocks: true
+      defensive_only: true
+      max_new_positions_per_day: 1
+      max_position_pct: 0.15
+      max_total_exposure_pct: 0.4
+      prefer_etfs: true
+    neutral:
+      allow_etfs: true
+      allow_stocks: true
+      max_new_positions_per_day: 2
+      max_position_pct: 0.3
+      max_total_exposure_pct: 0.8
+    range:
+      allow_etfs: true
+      allow_stocks: true
+      max_new_positions_per_day: 2
+      max_position_pct: 0.25
+      max_total_exposure_pct: 0.7
+position_limits:
+  cash_reserve:
+  - limit: 0.2
+    max_equity: 50000
+  - limit: 0.2
+    max_equity: null
+  long:
+  - limit: 0.2
+    max_equity: 50000
+  - limit: 0.15
+    max_equity: null
+  medium:
+  - limit: 0.25
+    max_equity: 50000
+  - limit: 0.15
+    max_equity: null
+  sector:
+  - limit: 0.4
+    max_equity: 50000
+  - limit: 0.35
+    max_equity: null
+  short:
+  - limit: 0.3
+    max_equity: 50000
+  - limit: 0.2
+    max_equity: null
 sector_allocations:
   AI算力:
-    allocation: 0.10        # 降权：4只全失败（原0.18）
+    allocation: 0.1
     reason: 过度集中，等待回调机会
     status: neutral
   其他:
-    allocation: 0.13        # 微调升权以保持总和=1.0（原0.10）
+    allocation: 0.13
     reason: 预留机动仓位
     status: neutral
   医药:
-    allocation: 0.10
+    allocation: 0.1
     reason: 政策影响待观察
     status: neutral
   半导体:
-    allocation: 0.10        # 降权：2只全失败（原0.15）
+    allocation: 0.1
     reason: 政策支持但短期追高风险
     status: neutral
   周期:
-    allocation: 0.12        # 升权：海螺水泥成功案例（原0.07）
+    allocation: 0.12
     reason: 超跌反弹机会
     status: neutral
   新能源:
-    allocation: 0.10        # 新增：隆基绿能成功案例
+    allocation: 0.1
     reason: 碳中和政策驱动，超跌反弹
     status: overweight
   新能源车:
@@ -45,58 +125,14 @@ sector_allocations:
     reason: 外围联动，等待催化
     status: neutral
   消费:
-    allocation: 0.10
+    allocation: 0.1
     reason: 基本面稳健
     status: neutral
   消费电子:
-    allocation: 0.05        # 降权：京东方止损（原0.10）
+    allocation: 0.05
     reason: 事件消化，观望为主
     status: underweight
   金融:
     allocation: 0.12
     reason: 估值合理，稳定配置
     status: neutral
-
-# P1-4: 仓位风控单一来源（auto_trader / risk_manager 共用，消除三处不一致）
-position_limits:
-  # 单票仓位上限，按持仓周期 horizon 分档（max_equity=null 为兜底档）
-  short:
-    - {max_equity: 10000, limit: 0.30}
-    - {max_equity: 50000, limit: 0.15}
-    - {max_equity: null, limit: 0.05}
-  medium:
-    - {max_equity: 10000, limit: 0.20}
-    - {max_equity: 50000, limit: 0.12}
-    - {max_equity: null, limit: 0.08}
-  long:
-    - {max_equity: 10000, limit: 0.20}
-    - {max_equity: 50000, limit: 0.12}
-    - {max_equity: null, limit: 0.10}
-  # 板块集中度上限
-  sector:
-    - {max_equity: 10000, limit: 0.70}
-    - {max_equity: 50000, limit: 0.50}
-    - {max_equity: null, limit: 0.35}
-  # 现金保留比例
-  cash_reserve:
-    - {max_equity: 10000, limit: 0.30}
-    - {max_equity: 50000, limit: 0.15}
-    - {max_equity: null, limit: 0.20}
-
-# B7: 初始资金单一来源（消除8处硬编码100000）
-initial_cash: 4000
-
-# 半自动模拟交易：默认安全关闭，完成飞书双向配置和验收后再显式开启。
-paper_trading:
-  enabled: false
-  mode: semi_auto
-  veto_minutes: 5
-  max_positions: 2
-  min_order_amount: 1000
-  max_position_pct: 0.30
-  cash_reserve_pct: 0.30
-  max_trade_risk_pct: 0.01
-  daily_loss_limit_pct: 0.015
-  max_drawdown_pause_pct: 0.10
-  quote_max_age_seconds: 60
-  intraday_interval_minutes: 30

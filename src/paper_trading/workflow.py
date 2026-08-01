@@ -11,6 +11,32 @@ from typing import Callable, Dict, List
 from src.data_collectors.realtime_prices import fetch_realtime_prices
 from src.notifier.feishu import FeishuNotifier
 from src.paper_trading.trading_service import TradingService
+from src.strategy.position_limits import (
+    get_cash_reserve_pct,
+    get_max_stock_price,
+    get_paper_trading_config,
+    get_position_limit,
+    get_regime_limits,
+    get_sector_limit,
+)
+from src.utils.cost_calculator import calculate_trade_costs
+
+
+DEFENSIVE_SECTORS = {
+    "公用事业", "银行", "食品饮料", "医药", "消费", "交通运输", "电力", "煤炭", "金融",
+}
+
+
+def _is_etf(stock: Dict) -> bool:
+    instrument_type = str(stock.get("instrument_type") or "").lower()
+    name = str(stock.get("name") or "").upper()
+    code = str(stock.get("code") or "")
+    return instrument_type == "etf" or "ETF" in name or code.startswith(("15", "16", "50", "51", "52", "56", "58"))
+
+
+def _is_defensive(stock: Dict) -> bool:
+    sector = str(stock.get("sector") or "")
+    return _is_etf(stock) or any(keyword in sector for keyword in DEFENSIVE_SECTORS)
 
 
 class PaperTradingWorkflow:
@@ -40,64 +66,141 @@ class PaperTradingWorkflow:
             return {"status": "safe_mode", "orders": [], "reason": "全市场候选池未通过，禁止开仓"}
         if not str(source_status.get("recommendation_prices", "")).startswith("ok_"):
             return {"status": "safe_mode", "orders": [], "reason": "推荐价格未全部通过真实行情校验，禁止开仓"}
-        account = self.service.get_account()
         regime = report.get("market_regime", "neutral")
-        if regime in {"bearish", "high_volatility"}:
-            return {
-                "status": "safe_mode",
-                "orders": [],
-                "reason": f"市场状态{regime}，¥{account['total_equity']:,.0f}账户暂停新开仓",
-            }
+        config = get_paper_trading_config()
+        policy = get_regime_limits(regime)
+        min_confidence = float(config.get("min_trade_confidence", 4))
         candidates = [
             stock for stock in report.get("stock_recommendations", [])
             if stock.get("action") == "setup_ready"
             and stock.get("trade_eligible") is True
             and stock.get("price_validation", {}).get("verified") is True
-            and float(stock.get("confidence") or 0) >= 4
+            and float(stock.get("confidence") or 0) >= min_confidence
+            and (policy.get("allow_etfs", True) if _is_etf(stock) else policy.get("allow_stocks", True))
+            and (not policy.get("defensive_only") or _is_defensive(stock))
         ]
+        if policy.get("prefer_etfs"):
+            candidates.sort(key=lambda stock: (not _is_etf(stock), -float(stock.get("confidence") or 0)))
+        else:
+            candidates.sort(key=lambda stock: -float(stock.get("confidence") or 0))
+        max_scan = int(config.get("max_candidates_to_scan", 10))
+        candidates = candidates[:max_scan]
+        if not candidates:
+            return {
+                "status": "no_orders",
+                "orders": [],
+                "rejected": [],
+                "reason": f"{regime}市场下没有满足当前仓位与质量规则的候选",
+            }
         codes = [stock.get("code") for stock in candidates if stock.get("code")]
         quotes = self.quote_fetcher(codes)
+        account = self.service.get_account()
         self.service.record_equity_snapshot(account["total_equity"], at=self.service.now().isoformat())
         run_id = report.get("run_id") or f"{self.service.now().date().isoformat()}-open"
         prepared, rejected, execution_results, notification_results = [], [], [], []
+        trade_date = self.service.now().date().isoformat()
+        buys_today = {
+            trade["code"] for trade in self.service.ledger.list_trades(trade_date=trade_date, limit=1000)
+            if trade.get("action") == "buy"
+        }
+        max_new_positions = int(policy.get("max_new_positions_per_day", 2))
+        remaining_new_positions = max(0, max_new_positions - len(buys_today))
+        if remaining_new_positions == 0:
+            return {
+                "status": "no_orders",
+                "orders": [],
+                "rejected": [],
+                "reason": f"今日已达到{max_new_positions}只新开仓上限",
+                "account_equity": account["total_equity"],
+            }
 
-        for stock in candidates[:4]:
+        for stock in candidates:
             code = stock.get("code")
             quote = quotes.get(code) or {}
             price = float(quote.get("price") or 0)
             if price <= 0:
                 rejected.append({"code": code, "reason": "09:35行情不可用"})
                 continue
-            position_pct = 0.25 if regime == "range" else 0.30
-            max_amount = min(account["total_equity"] * position_pct, account["cash"] - account["total_equity"] * 0.30)
-            quantity = int(max_amount // (price * 100)) * 100
-            if quantity < 100 or price * quantity < 1000:
+            if not _is_etf(stock) and price > get_max_stock_price():
+                rejected.append({"code": code, "reason": f"最新价¥{price:.2f}超过¥{get_max_stock_price():.0f}价格上限"})
+                continue
+
+            account = self.service.get_account()
+            positions = self.service.get_positions(trade_date)
+            if any(position["code"] == code for position in positions):
+                rejected.append({"code": code, "reason": "已有持仓，本轮优先增加持仓多样性"})
+                continue
+            max_positions = int(config.get("max_positions", 5))
+            if len(positions) >= max_positions:
+                rejected.append({"code": code, "reason": f"已达到{max_positions}只持仓上限"})
+                break
+            sector = stock.get("sector") or "其他"
+            same_sector = [position for position in positions if (position.get("sector") or "其他") == sector]
+            same_sector_max = int(config.get("same_sector_max_positions", 2))
+            if len(same_sector) >= same_sector_max:
+                rejected.append({"code": code, "reason": f"{sector}板块已有{same_sector_max}只持仓"})
+                continue
+
+            equity = float(account["total_equity"])
+            exposure = sum(float(position.get("market_value") or 0) for position in positions)
+            sector_exposure = sum(float(position.get("market_value") or 0) for position in same_sector)
+            horizon = stock.get("horizon", "short")
+            position_pct = min(
+                float(policy.get("max_position_pct", 0.30)),
+                float(config.get("max_position_pct", 0.30)),
+                get_position_limit(equity, horizon),
+            )
+            reserve_pct = max(float(config.get("cash_reserve_pct", 0.20)), get_cash_reserve_pct(equity))
+            max_amount = min(
+                equity * position_pct,
+                equity * float(policy.get("max_total_exposure_pct", 0.80)) - exposure,
+                equity * get_sector_limit(equity) - sector_exposure,
+                float(account["cash"]) - equity * reserve_pct,
+            )
+            stop = float(stock.get("stop_loss_price") or stock.get("timing", {}).get("stop_loss_price") or price * 0.97)
+            instrument_type = "etf" if _is_etf(stock) else str(stock.get("instrument_type") or "stock")
+            quantity = self._maximum_quantity(
+                price=price,
+                stop=stop,
+                max_amount=max_amount,
+                equity=equity,
+                cash=float(account["cash"]),
+                reserve_pct=reserve_pct,
+                instrument_type=instrument_type,
+                max_trade_risk_pct=float(config.get("max_trade_risk_pct", 0.0075)),
+                remaining_daily_risk=max(
+                    0.0,
+                    equity * float(config.get("max_daily_new_risk_pct", 0.015))
+                    - self.service.daily_new_risk_amount(trade_date),
+                ),
+            )
+            min_order_amount = float(config.get("min_order_amount", 1000))
+            if quantity < 100 or price * quantity < min_order_amount:
                 rejected.append({
                     "code": code,
                     "reason": (
-                        f"100股需¥{price * 100:,.0f}，超过当前单票可用上限¥{max_amount:,.0f}，"
-                        "或不满足¥1,000最小订单"
+                        f"100股需¥{price * 100:,.0f}，当前仓位/现金/风险可用上限¥{max(0, max_amount):,.0f}，"
+                        f"或不满足¥{min_order_amount:,.0f}最小订单"
                     ),
                 })
                 continue
             recommendation_id = stock.get("recommendation_id") or f"REC-{run_id}-{code}"
-            stop = stock.get("stop_loss_price") or stock.get("timing", {}).get("stop_loss_price")
             target = stock.get("target_price") or stock.get("timing", {}).get("target_observation_price")
             order = self.service.propose_order(
                 run_id=run_id,
                 recommendation_id=recommendation_id,
                 code=code,
                 name=stock.get("name") or code,
-                sector=stock.get("sector") or "其他",
+                sector=sector,
                 action="buy",
                 quantity=quantity,
                 planned_price=price,
                 min_price=round(price * 0.99, 3),
                 max_price=round(price * 1.01, 3),
-                stop_price=float(stop or price * 0.97),
+                stop_price=stop,
                 target_price=float(target or price * 1.06),
-                instrument_type=stock.get("instrument_type", "stock"),
-                horizon=stock.get("horizon", "short"),
+                instrument_type=instrument_type,
+                horizon=horizon,
                 reason=stock.get("reason", ""),
             )
             if order["status"] in {"proposed", "pre_notified"}:
@@ -129,7 +232,7 @@ class PaperTradingWorkflow:
             if not result.get("success"):
                 continue
             prepared.append(final)
-            if len(prepared) >= 2:
+            if len(prepared) >= remaining_new_positions:
                 break
         failed_notifications = [
             item for item in notification_results if item.get("status") != "success"
@@ -150,7 +253,39 @@ class PaperTradingWorkflow:
                 else {"status": "success", "data": {}}
             ),
             "account_equity": account["total_equity"],
+            "market_regime": regime,
+            "applied_policy": policy,
         }
+
+    @staticmethod
+    def _maximum_quantity(
+        *,
+        price: float,
+        stop: float,
+        max_amount: float,
+        equity: float,
+        cash: float,
+        reserve_pct: float,
+        instrument_type: str,
+        max_trade_risk_pct: float,
+        remaining_daily_risk: float,
+    ) -> int:
+        """按100股一手向下取整，同时满足资金与风险预算。"""
+        if price <= 0 or stop <= 0 or stop >= price or max_amount <= 0 or remaining_daily_risk <= 0:
+            return 0
+        risk_budget = min(equity * max_trade_risk_pct, remaining_daily_risk)
+        quantity = int(max_amount // (price * 100)) * 100
+        while quantity >= 100:
+            buy_cost = calculate_trade_costs(price * quantity, "buy", instrument_type)["total_cost"]
+            exit_cost = calculate_trade_costs(stop * quantity, "sell", instrument_type)["total_cost"]
+            risk_amount = (price - stop) * quantity + exit_cost
+            if (
+                price * quantity + buy_cost <= cash - equity * reserve_pct + 1e-9
+                and risk_amount <= risk_budget + 1e-9
+            ):
+                return quantity
+            quantity -= 100
+        return 0
 
     def execute_due_orders(self) -> Dict:
         """恢复扫描：执行已自动确认或遗留确认窗口到期的订单。"""

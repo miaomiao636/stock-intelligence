@@ -530,8 +530,9 @@ def paper():
 def init(cash):
     """初始化模拟账户"""
     from src.paper_trading.trading_service import TradingService
+    from src.strategy.position_limits import get_initial_cash
     service = TradingService()
-    result = service.initialize_account(cash or 4000)
+    result = service.initialize_account(cash or get_initial_cash())
     click.echo(f"  ✅ 模拟账户已初始化")
     click.echo(f"  初始资金: {result['initial_cash']:,.0f}")
 

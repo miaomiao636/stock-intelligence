@@ -65,6 +65,36 @@ def get_cash_reserve_pct(total_equity: float) -> float:
 
 
 def get_initial_cash() -> float:
-    """B7: 获取初始资金（单一来源，消除8处硬编码100000）"""
+    """获取新建模拟账户的默认本金。"""
     cfg = _load_config()
-    return float(cfg.get("initial_cash", 4000))
+    return float(cfg.get("initial_cash", 20000))
+
+
+def get_paper_trading_config() -> dict:
+    """返回模拟交易配置副本，供选仓和最终成交风控共用。"""
+    cfg = _load_config().get("paper_trading", {})
+    return dict(cfg) if isinstance(cfg, dict) else {}
+
+
+def get_regime_limits(market_regime: str) -> dict:
+    """返回指定市场状态的仓位规则，并与全局规则合并。"""
+    cfg = get_paper_trading_config()
+    regimes = cfg.get("regime_limits", {})
+    regime = market_regime if market_regime in regimes else "neutral"
+    merged = {
+        "max_position_pct": float(cfg.get("max_position_pct", 0.30)),
+        "max_total_exposure_pct": float(cfg.get("max_total_exposure_pct", 0.80)),
+        "max_new_positions_per_day": int(cfg.get("max_new_positions_per_day", 2)),
+        "allow_stocks": True,
+        "allow_etfs": True,
+    }
+    selected = regimes.get(regime, {})
+    if isinstance(selected, dict):
+        merged.update(selected)
+    return merged
+
+
+def get_max_stock_price() -> float:
+    """获取策略允许的最高股票价格。"""
+    cfg = _load_config().get("custom_params", {})
+    return float(cfg.get("max_stock_price", 50))

@@ -10,7 +10,15 @@ from pathlib import Path
 from typing import Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
+from src.data_collectors.trading_calendar import count_trading_days
 from src.storage.trading_ledger import TradingLedger
+from src.strategy.position_limits import (
+    get_cash_reserve_pct,
+    get_initial_cash,
+    get_paper_trading_config,
+    get_position_limit,
+    get_sector_limit,
+)
 from src.utils.cost_calculator import calculate_trade_costs
 
 
@@ -36,8 +44,8 @@ class TradingService:
             value = value.replace(tzinfo=SHANGHAI)
         return value.astimezone(SHANGHAI)
 
-    def initialize_account(self, initial_cash: float = 4000, reset: bool = False) -> Dict:
-        return self.ledger.initialize_account(initial_cash, reset=reset)
+    def initialize_account(self, initial_cash: float = None, reset: bool = False) -> Dict:
+        return self.ledger.initialize_account(initial_cash or get_initial_cash(), reset=reset)
 
     def get_account(self) -> Dict:
         return self.ledger.get_account()
@@ -269,24 +277,106 @@ class TradingService:
             return "最大回撤达到10%，新开仓已暂停"
         if risk_state["daily_loss_pct"] >= 1.5:
             return "当日亏损达到1.5%，新开仓已暂停"
-        if amount < 1000:
-            return "单笔金额低于¥1,000经济订单下限"
-        if len(positions) >= 2 and not any(p["code"] == order["code"] for p in positions):
-            return "¥4,000账户最多同时持有2只标的"
+        config = get_paper_trading_config()
+        equity = float(account["total_equity"])
+        min_order_amount = float(config.get("min_order_amount", 1000))
+        if amount < min_order_amount:
+            return f"单笔金额低于¥{min_order_amount:,.0f}经济订单下限"
+        current_position = next((p for p in positions if p["code"] == order["code"]), None)
+        max_positions = int(config.get("max_positions", 5))
+        if len(positions) >= max_positions and not current_position:
+            return f"账户最多同时持有{max_positions}只标的"
+        if not current_position:
+            buys_today = {
+                trade["code"] for trade in self.ledger.list_trades(trade_date=trade_date, limit=1000)
+                if trade.get("action") == "buy"
+            }
+            max_new_positions = int(config.get("max_new_positions_per_day", 2))
+            if order["code"] not in buys_today and len(buys_today) >= max_new_positions:
+                return f"今日最多新开仓{max_new_positions}只"
+            same_sector = [
+                position for position in positions
+                if (position.get("sector") or "其他") == (order.get("sector") or "其他")
+            ]
+            same_sector_max = int(config.get("same_sector_max_positions", 2))
+            if len(same_sector) >= same_sector_max:
+                return f"同一板块最多持有{same_sector_max}只标的"
+            cooldown_error = self._reentry_cooldown_error(order["code"], trade_date, config)
+            if cooldown_error:
+                return cooldown_error
         total_cost = amount + costs["total_cost"]
         if total_cost > account["cash"]:
             return "现金不足"
-        if amount / account["total_equity"] > 0.30 + 1e-9:
-            return "单只初始仓位超过30%"
-        if account["cash"] - total_cost < account["total_equity"] * 0.30:
-            return "成交后现金储备低于30%"
+        current_value = float(current_position.get("market_value") or 0) if current_position else 0.0
+        max_position_pct = min(
+            float(config.get("max_position_pct", 0.30)),
+            get_position_limit(equity, order.get("horizon") or "short"),
+        )
+        if (current_value + amount) / equity > max_position_pct + 1e-9:
+            return f"单只持仓超过{max_position_pct*100:.0f}%上限"
+        reserve_pct = max(float(config.get("cash_reserve_pct", 0.20)), get_cash_reserve_pct(equity))
+        if account["cash"] - total_cost < equity * reserve_pct:
+            return f"成交后现金储备低于{reserve_pct*100:.0f}%"
+        total_exposure = sum(float(position.get("market_value") or 0) for position in positions)
+        max_total_exposure_pct = float(config.get("max_total_exposure_pct", 0.80))
+        if (total_exposure + amount) / equity > max_total_exposure_pct + 1e-9:
+            return f"总持仓超过{max_total_exposure_pct*100:.0f}%上限"
+        sector_exposure = sum(
+            float(position.get("market_value") or 0)
+            for position in positions
+            if (position.get("sector") or "其他") == (order.get("sector") or "其他")
+        )
+        sector_limit = get_sector_limit(equity)
+        if (sector_exposure + amount) / equity > sector_limit + 1e-9:
+            return f"板块持仓超过{sector_limit*100:.0f}%上限"
         stop = order.get("stop_price")
         if not stop or stop >= price:
             return "买入订单缺少有效止损价"
         exit_cost = calculate_trade_costs(stop * order["quantity"], "sell", order["instrument_type"])["total_cost"]
-        account_risk = ((price - stop) * order["quantity"] + exit_cost) / account["total_equity"]
-        if account_risk > 0.01 + 1e-9:
-            return f"单笔账户风险{account_risk*100:.2f}%超过1%"
+        risk_amount = (price - stop) * order["quantity"] + exit_cost
+        account_risk = risk_amount / equity
+        max_trade_risk_pct = float(config.get("max_trade_risk_pct", 0.0075))
+        if account_risk > max_trade_risk_pct + 1e-9:
+            return f"单笔账户风险{account_risk*100:.2f}%超过{max_trade_risk_pct*100:.2f}%"
+        max_daily_new_risk_pct = float(config.get("max_daily_new_risk_pct", 0.015))
+        if self.daily_new_risk_amount(trade_date) + risk_amount > equity * max_daily_new_risk_pct + 1e-9:
+            return f"当日新增风险超过{max_daily_new_risk_pct*100:.2f}%"
+        return None
+
+    def daily_new_risk_amount(self, trade_date: str) -> float:
+        """按当日已成交买单的止损距离汇总新增风险金额。"""
+        risk = 0.0
+        for order in self.ledger.list_orders(["filled"], trade_date):
+            if order.get("action") != "buy" or not order.get("stop_price"):
+                continue
+            trade = self.ledger.get_trade_by_order(order["order_id"])
+            if not trade:
+                continue
+            price = float(trade["price"])
+            stop = float(order["stop_price"])
+            if stop >= price:
+                continue
+            quantity = int(trade["quantity"])
+            exit_cost = calculate_trade_costs(
+                stop * quantity, "sell", order.get("instrument_type") or "stock"
+            )["total_cost"]
+            risk += (price - stop) * quantity + exit_cost
+        return round(risk, 4)
+
+    def _reentry_cooldown_error(self, code: str, trade_date: str, config: Dict) -> Optional[str]:
+        cooldown_days = int(config.get("reentry_cooldown_trading_days", 2))
+        if cooldown_days <= 0:
+            return None
+        sells = [
+            trade for trade in self.ledger.list_trades(limit=1000)
+            if trade.get("action") == "sell" and trade.get("code") == code
+        ]
+        if not sells:
+            return None
+        last_sell = max(str(trade["trade_date"]) for trade in sells)
+        elapsed = count_trading_days(date.fromisoformat(last_sell), date.fromisoformat(trade_date))
+        if elapsed <= cooldown_days:
+            return f"卖出后需冷却{cooldown_days}个交易日，当前仅过{elapsed}个"
         return None
 
     def _fill(self, order: Dict, market_price: float, now: datetime) -> Dict:

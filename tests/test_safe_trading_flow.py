@@ -24,13 +24,18 @@ def quote(code: str, price: float, at: datetime) -> dict:
     }
 
 
-def proposed_buy(service: TradingService, code: str = "000001", price: float = 10.0) -> dict:
+def proposed_buy(
+    service: TradingService,
+    code: str = "000001",
+    price: float = 10.0,
+    sector: str = "测试",
+) -> dict:
     return service.propose_order(
         run_id="2026-07-13-open",
         recommendation_id=f"REC-{code}",
         code=code,
         name=f"测试{code}",
-        sector="测试",
+        sector=sector,
         action="buy",
         quantity=100,
         planned_price=price,
@@ -52,7 +57,7 @@ def open_time() -> datetime:
 def service(tmp_path, open_time) -> TradingService:
     clock = {"now": open_time}
     result = TradingService(tmp_path, now_provider=lambda: clock["now"])
-    result.initialize_account(4000)
+    result.initialize_account(20000)
     result._test_clock = clock
     return result
 
@@ -67,7 +72,7 @@ def test_confirm_revalidates_and_fills_with_costs(service, open_time):
     assert result["success"] is True
     assert result["order"]["status"] == "filled"
     assert result["trade"]["fees"] >= 5
-    assert service.get_account()["cash"] < 3000
+    assert service.get_account()["cash"] < 19000
     assert service.get_positions()[0]["recommendation_id"] == "REC-000001"
     replay = service.execute_ready_order(order["order_id"], quote("000001", 10.02, open_time))
     assert replay["success"] is False
@@ -167,7 +172,7 @@ def test_stock_is_t_plus_one(service, open_time):
     assert "T+1" in result["error"]
 
 
-def test_4000_account_rules_limit_positions_and_preserve_cash(service, open_time):
+def test_20000_account_limits_daily_new_positions_and_preserves_cash(service, open_time):
     for code in ("000001", "000002"):
         order = proposed_buy(service, code)
         service.mark_final_notified(order["order_id"], notified_at=open_time, veto_minutes=5)
@@ -181,16 +186,43 @@ def test_4000_account_rules_limit_positions_and_preserve_cash(service, open_time
 
     assert rejected["success"] is False
     assert len(service.get_positions()) == 2
-    assert service.get_account()["cash"] >= 4000 * 0.30
+    assert service.get_account()["cash"] >= 20000 * 0.20
+
+
+def test_20000_account_allows_five_positions_across_days_but_rejects_sixth(service):
+    dates = [
+        datetime(2026, 7, 13, 9, 35, tzinfo=TZ),
+        datetime(2026, 7, 13, 9, 36, tzinfo=TZ),
+        datetime(2026, 7, 14, 9, 35, tzinfo=TZ),
+        datetime(2026, 7, 14, 9, 36, tzinfo=TZ),
+        datetime(2026, 7, 15, 9, 35, tzinfo=TZ),
+    ]
+    for index, at in enumerate(dates, start=1):
+        service._test_clock["now"] = at
+        code = f"00000{index}"
+        order = proposed_buy(service, code, sector=f"板块{index}")
+        service.confirm_automatically(order["order_id"])
+        assert service.execute_ready_order(order["order_id"], quote(code, 10.0, at))["success"]
+
+    service._test_clock["now"] = datetime(2026, 7, 16, 9, 35, tzinfo=TZ)
+    sixth = proposed_buy(service, "000006", sector="板块6")
+    service.confirm_automatically(sixth["order_id"])
+    result = service.execute_ready_order(
+        sixth["order_id"], quote("000006", 10.0, service._test_clock["now"])
+    )
+
+    assert result["success"] is False
+    assert "5只" in result["error"]
+    assert len(service.get_positions()) == 5
 
 
 def test_equity_metrics_use_net_equity_and_peak_drawdown(service):
-    service.record_equity_snapshot(4000, at="2026-07-13T15:00:00+08:00")
-    service.record_equity_snapshot(4200, at="2026-07-14T15:00:00+08:00")
-    service.record_equity_snapshot(3780, at="2026-07-15T15:00:00+08:00")
+    service.record_equity_snapshot(20000, at="2026-07-13T15:00:00+08:00")
+    service.record_equity_snapshot(21000, at="2026-07-14T15:00:00+08:00")
+    service.record_equity_snapshot(18900, at="2026-07-15T15:00:00+08:00")
 
     metrics = service.get_performance_metrics()
-    assert metrics["net_return"] == pytest.approx(-220)
+    assert metrics["net_return"] == pytest.approx(-1100)
     assert metrics["max_drawdown_pct"] == pytest.approx(10.0)
 
 
@@ -220,8 +252,8 @@ def test_feishu_trade_card_has_three_safe_actions(service):
 
 
 def test_daily_loss_gate_stops_new_positions(service, open_time):
-    service.record_equity_snapshot(4000, at="2026-07-13T09:35:00+08:00")
-    service.record_equity_snapshot(3939, at="2026-07-13T10:05:00+08:00")
+    service.record_equity_snapshot(20000, at="2026-07-13T09:35:00+08:00")
+    service.record_equity_snapshot(19690, at="2026-07-13T10:05:00+08:00")
     order = proposed_buy(service)
     service.mark_final_notified(order["order_id"], open_time)
     service.record_decision(order["order_id"], "confirm")
@@ -233,7 +265,7 @@ def test_daily_loss_gate_stops_new_positions(service, open_time):
 def test_callback_and_scheduler_cannot_double_fill(tmp_path, open_time):
     first = TradingService(tmp_path, now_provider=lambda: open_time)
     second = TradingService(tmp_path, now_provider=lambda: open_time)
-    first.initialize_account(4000)
+    first.initialize_account(20000)
     order = proposed_buy(first)
     first.mark_final_notified(order["order_id"], open_time)
     first.record_decision(order["order_id"], "confirm")

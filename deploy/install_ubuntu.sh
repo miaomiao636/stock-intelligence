@@ -143,7 +143,7 @@ chmod 600 .env
 
 echo "[5/9] Initializing project data..."
 python cli.py init
-python cli.py paper init --cash 4000 || true
+python cli.py paper init || true
 
 echo "[6/9] Installing web service..."
 cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF

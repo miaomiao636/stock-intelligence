@@ -53,7 +53,7 @@ def test_0935_workflow_auto_executes_and_notifies(tmp_path, monkeypatch):
         quote_fetcher=fetch,
         now_provider=lambda: clock["now"],
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
     report = {
         "run_id": "2026-07-13-morning",
         "market_regime": "bullish",
@@ -90,7 +90,7 @@ def test_0935_workflow_auto_executes_and_notifies(tmp_path, monkeypatch):
 def test_degraded_source_never_prepares_order(tmp_path, monkeypatch):
     monkeypatch.setenv("PAPER_TRADING_ENABLED", "true")
     workflow = PaperTradingWorkflow(tmp_path, notifier=FakeNotifier(), quote_fetcher=lambda _: {})
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
     result = workflow.prepare_final_orders({"stock_recommendations": []}, {"llm": "fallback"})
     assert result["status"] == "safe_mode"
     assert workflow.service.ledger.list_orders() == []
@@ -107,7 +107,7 @@ def test_auto_execution_does_not_depend_on_callback(tmp_path, monkeypatch):
         quote_fetcher=_quote_fetcher(clock),
         now_provider=lambda: clock["now"],
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
 
     result = workflow.prepare_final_orders(
         _tradeable_report("REC-NO-CALLBACK"),
@@ -119,8 +119,8 @@ def test_auto_execution_does_not_depend_on_callback(tmp_path, monkeypatch):
     assert workflow.service.get_positions()[0]["code"] == "000001"
 
 
-def test_high_volatility_pause_is_decided_before_callback_probe(tmp_path, monkeypatch):
-    """风险暂停是业务结论，不应被临时回调故障遮蔽。"""
+def test_high_volatility_without_defensive_candidate_creates_no_order(tmp_path, monkeypatch):
+    """高波动期不强制交易；没有合格防御候选时保持空仓。"""
     monkeypatch.setenv("PAPER_TRADING_ENABLED", "true")
     notifier = FakeNotifier()
     notifier.callback_reachable = False
@@ -129,16 +129,79 @@ def test_high_volatility_pause_is_decided_before_callback_probe(tmp_path, monkey
         notifier=notifier,
         quote_fetcher=lambda _: (_ for _ in ()).throw(AssertionError("暂停交易时不应取行情")),
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
 
     result = workflow.prepare_final_orders(
         {"market_regime": "high_volatility", "stock_recommendations": []},
         {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_0"},
     )
 
-    assert result["status"] == "safe_mode"
+    assert result["status"] == "no_orders"
     assert "high_volatility" in result["reason"]
     assert "回调" not in result["reason"]
+
+
+def test_high_volatility_prefers_one_etf_and_caps_position_at_fifteen_percent(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_ENABLED", "true")
+    clock = {"now": datetime(2026, 7, 13, 9, 35, tzinfo=TZ)}
+    workflow = PaperTradingWorkflow(
+        tmp_path,
+        notifier=FakeNotifier(),
+        quote_fetcher=lambda codes: {
+            code: {
+                "code": code,
+                "name": "新能源ETF",
+                "price": 2.0,
+                "quote_time": clock["now"].isoformat(),
+                "trade_date": clock["now"].date().isoformat(),
+                "trade_status": "trading",
+                "source_time_reliable": True,
+            }
+            for code in codes
+        },
+        now_provider=lambda: clock["now"],
+    )
+    workflow.service.initialize_account(20000)
+    report = {
+        "run_id": "2026-07-13-high-volatility",
+        "market_regime": "high_volatility",
+        "stock_recommendations": [
+            {
+                "recommendation_id": "REC-HIGH-VOL-STOCK",
+                "code": "600001",
+                "name": "高波动成长股",
+                "sector": "半导体",
+                "action": "setup_ready",
+                "trade_eligible": True,
+                "confidence": 5,
+                "price_validation": {"verified": True},
+                "stop_loss_price": 9.7,
+            },
+            {
+                "recommendation_id": "REC-HIGH-VOL-ETF",
+                "code": "516160",
+                "name": "新能源ETF",
+                "sector": "新能源",
+                "instrument_type": "etf",
+                "action": "setup_ready",
+                "trade_eligible": True,
+                "confidence": 4,
+                "price_validation": {"verified": True},
+                "stop_loss_price": 1.94,
+                "target_price": 2.12,
+            },
+        ],
+    }
+
+    result = workflow.prepare_final_orders(
+        report,
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_2"},
+    )
+
+    assert result["status"] == "success"
+    assert len(result["orders"]) == 1
+    assert result["orders"][0]["code"] == "516160"
+    assert result["orders"][0]["quantity"] * 2.0 <= 20000 * 0.15
 
 
 def _tradeable_report(recommendation_id):
@@ -186,7 +249,7 @@ def test_due_order_is_rejected_when_callback_becomes_unreachable(tmp_path, monke
         quote_fetcher=_quote_fetcher(clock),
         now_provider=lambda: clock["now"],
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
     order = workflow.service.propose_order(
         run_id="legacy-offline",
         recommendation_id="REC-OFFLINE",
@@ -224,7 +287,7 @@ def test_confirmed_order_executes_without_second_callback_probe(tmp_path, monkey
         quote_fetcher=_quote_fetcher(clock),
         now_provider=lambda: clock["now"],
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
     order = workflow.service.propose_order(
         run_id="legacy-confirmed",
         recommendation_id="REC-CONFIRMED",
@@ -273,7 +336,7 @@ def test_intraday_risk_exit_auto_executes_and_notifies(tmp_path, monkeypatch):
         quote_fetcher=fetch,
         now_provider=lambda: clock["now"],
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
     buy = workflow.service.propose_order(
         run_id="buy-day-one",
         recommendation_id="REC-AUTO-EXIT",
@@ -309,7 +372,7 @@ def test_intraday_check_is_disabled_when_paper_trading_is_off(tmp_path, monkeypa
         notifier=FakeNotifier(),
         quote_fetcher=lambda _: (_ for _ in ()).throw(AssertionError("不应取行情")),
     )
-    workflow.service.initialize_account(4000)
+    workflow.service.initialize_account(20000)
 
     result = workflow.intraday_check()
 
