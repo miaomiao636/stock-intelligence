@@ -104,6 +104,9 @@ def calculate_metrics(
     progress_score = calculate_progress_score(stock_results)
     closed_statuses = {"hit", "hit_target", "stopped", "stopped_out", "deep_loss", "expired"}
     closed_results = [r for r in valid_results if r.get("status") in closed_statuses]
+    win_statuses = {"hit", "hit_target"}
+    winning_count = sum(1 for r in closed_results if r.get("status") in win_statuses)
+    losing_count = len(closed_results) - winning_count
     active_count = len(valid_results) - len(closed_results)
     profit_loss_ratio = calculate_profit_loss_ratio(closed_results)
     
@@ -128,7 +131,11 @@ def calculate_metrics(
         "benchmark_return_pct": round(benchmark_return, 2),
         "win_rate_pct": round(win_rate, 2),
         "win_rate_basis": "closed_samples_only",
+        "return_basis": "recommendation_entry_to_close",
+        "valid_recommendations": len(valid_results),
         "closed_recommendations": len(closed_results),
+        "winning_recommendations": winning_count,
+        "losing_recommendations": losing_count,
         "active_recommendations": active_count,
         "sample_coverage_pct": round(len(closed_results) / len(valid_results) * 100, 2) if valid_results else 0,
         "progress_score_pct": round(progress_score, 2),

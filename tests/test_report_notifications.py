@@ -197,6 +197,64 @@ def test_closing_formatter_survives_malformed_optional_sections():
     assert "数据降级" in content
 
 
+def test_closing_formatter_separates_account_loss_from_signal_returns():
+    content = format_closing_report(
+        "2026-08-10",
+        market_data={"indices": {}},
+        evaluation={
+            "status": "success",
+            "quality": {"valid": 5, "total": 5},
+            "metrics": {
+                "win_rate_pct": 100.0,
+                "avg_return_pct": 3.53,
+                "closed_recommendations": 1,
+                "active_recommendations": 4,
+                "winning_recommendations": 1,
+                "losing_recommendations": 0,
+            },
+            "stock_results": [
+                {"code": "002407", "name": "多氟多", "status": "hit", "return_pct": 8.66},
+                {"code": "600667", "name": "太极实业", "status": "active", "return_pct": 1.74},
+                {"code": "000725", "name": "京东方A", "status": "active", "return_pct": 0.0},
+                {"code": "002396", "name": "星网锐捷", "status": "active", "return_pct": 4.60},
+                {"code": "603993", "name": "洛阳钼业", "status": "active", "return_pct": 2.67},
+            ],
+        },
+        account_summary={
+            "status": "ok",
+            "cash": 8082.25,
+            "market_value": 11890.0,
+            "total_equity": 19972.25,
+            "total_return": -27.75,
+            "total_return_pct": -0.14,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": -65.0,
+            "position_count": 5,
+            "max_drawdown_pct": 2.5,
+            "total_transaction_costs": 12.5,
+        },
+    )
+
+    assert "模拟账户盘后结算（账户口径）" in content
+    assert "-¥27.75 (-0.14%)" in content
+    assert "今日推荐信号评估结果（非账户收益）" in content
+    assert "100.0%（1/1）" in content
+    assert "进行中样本: 4" in content
+    assert "信号平均浮动收益: 3.53%" in content
+    assert "不等于模拟账户收益" in content
+
+
+def test_closing_formatter_does_not_imply_account_profit_without_snapshot():
+    content = format_closing_report(
+        "2026-08-10",
+        market_data={"indices": {}},
+        evaluation=_closing_result("success")["evaluation"],
+    )
+
+    assert "未保存账户结算快照" in content
+    assert "不得据此判断账户盈亏" in content
+
+
 def test_earlier_success_receipt_prevents_later_watchdog_duplicate():
     report_delivery.record_delivery(
         "2026-07-14",

@@ -155,11 +155,13 @@ def format_closing_report(
     market_data: Dict,
     evaluation: Dict,
     warnings: List[str] | None = None,
+    account_summary: Dict | None = None,
 ) -> str:
     """格式化盘后报告；辅助数据降级时仍生成可读报告。"""
     market_data = market_data if isinstance(market_data, dict) else {}
     evaluation = evaluation if isinstance(evaluation, dict) else {}
     warnings = warnings if isinstance(warnings, list) else []
+    account_summary = account_summary if isinstance(account_summary, dict) else {}
     lines = [f"🌆 盘后复盘 - {date_str}", ""]
 
     if evaluation.get("status") == "degraded" or warnings:
@@ -197,6 +199,36 @@ def format_closing_report(
         lines.append("  市场指数数据暂不可用")
     lines.append("")
 
+    lines.append("💰 模拟账户盘后结算（账户口径）")
+    if account_summary.get("status") == "ok":
+        cash = float(account_summary.get("cash") or 0)
+        market_value = float(account_summary.get("market_value") or 0)
+        total_equity = float(account_summary.get("total_equity") or 0)
+        total_return = float(account_summary.get("total_return") or 0)
+        total_return_pct = float(account_summary.get("total_return_pct") or 0)
+        realized_pnl = float(account_summary.get("realized_pnl") or 0)
+        unrealized_pnl = float(account_summary.get("unrealized_pnl") or 0)
+        transaction_costs = float(account_summary.get("total_transaction_costs") or 0)
+        return_sign = "+" if total_return >= 0 else "-"
+        lines.extend([
+            f"  可用现金: ¥{cash:,.2f}",
+            f"  持仓市值: ¥{market_value:,.2f}",
+            f"  总资产: ¥{total_equity:,.2f}",
+            (
+                "  现金流及交易成本调整后总收益: "
+                f"{return_sign}¥{abs(total_return):,.2f} ({total_return_pct:+.2f}%)"
+            ),
+            f"  已实现盈亏: {realized_pnl:+,.2f}元｜未实现盈亏: {unrealized_pnl:+,.2f}元",
+            (
+                f"  当前持仓: {int(account_summary.get('position_count') or 0)}只｜"
+                f"最大回撤: {float(account_summary.get('max_drawdown_pct') or 0):.2f}%｜"
+                f"累计交易成本: ¥{transaction_costs:,.2f}"
+            ),
+        ])
+    else:
+        lines.append("  ⚠️ 本报告未保存账户结算快照，不得据此判断账户盈亏。")
+    lines.append("")
+
     quality = evaluation.get("quality")
     quality = quality if isinstance(quality, dict) else {}
     metrics = evaluation.get("metrics")
@@ -205,18 +237,32 @@ def format_closing_report(
     avg_return = metrics.get("avg_return_pct", 0)
     win_rate = win_rate if isinstance(win_rate, (int, float)) else 0
     avg_return = avg_return if isinstance(avg_return, (int, float)) else 0
-    lines.extend([
-        "📊 评估结果",
-        f"  评估状态: {evaluation.get('status', 'unknown')}",
-        f"  有效样本: {quality.get('valid', 0)}/{quality.get('total', 0)}",
-        f"  胜率: {win_rate:.1f}%",
-        f"  平均收益: {avg_return:.2f}%",
-        "",
-        "📈 个股表现",
-    ])
-
     stock_results = evaluation.get("stock_results", [])
     stock_results = stock_results if isinstance(stock_results, list) else []
+    valid_results = [item for item in stock_results if isinstance(item, dict) and item.get("status") != "error"]
+    win_statuses = {"hit", "hit_target"}
+    loss_statuses = {"stopped", "stopped_out", "deep_loss", "expired"}
+    closed_results = [item for item in valid_results if item.get("status") in win_statuses | loss_statuses]
+    closed_count = int(metrics.get("closed_recommendations", len(closed_results)) or 0)
+    active_count = int(metrics.get("active_recommendations", len(valid_results) - len(closed_results)) or 0)
+    winning_count = int(
+        metrics.get(
+            "winning_recommendations",
+            sum(1 for item in closed_results if item.get("status") in win_statuses),
+        ) or 0
+    )
+    lines.extend([
+        "📊 今日推荐信号评估结果（非账户收益）",
+        f"  评估状态: {evaluation.get('status', 'unknown')}",
+        f"  可评估信号: {quality.get('valid', 0)}/{quality.get('total', 0)}",
+        f"  已结束样本胜率: {win_rate:.1f}%（{winning_count}/{closed_count}）",
+        f"  进行中样本: {active_count}",
+        f"  信号平均浮动收益: {avg_return:.2f}%",
+        "  注: 信号收益按推荐进场价计算，不等于模拟账户收益。",
+        "",
+        "📈 推荐信号表现",
+    ])
+
     stock_count = 0
     if stock_results:
         for stock in stock_results:
@@ -224,7 +270,12 @@ def format_closing_report(
                 continue
             stock_count += 1
             status = stock.get("status", "")
-            status_icon = "✅" if status == "hit" else "❌" if status == "stopped" else "⏳" if status == "active" else "⚠️"
+            status_icon = (
+                "✅" if status in win_statuses
+                else "❌" if status in loss_statuses
+                else "⏳" if status in {"active", "near_target", "profitable"}
+                else "⚠️"
+            )
             return_pct = stock.get("return_pct", 0)
             return_text = f"{return_pct:.2f}%" if isinstance(return_pct, (int, float)) else "--"
             lines.append(f"  {status_icon} {stock.get('code', '')} {stock.get('name', '')}: {return_text}")

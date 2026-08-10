@@ -105,7 +105,23 @@ class Evaluator:
 
         code = stock.get("code", "")
         name = stock.get("name", "")
-        entry_price = stock.get("entry_price") or stock.get("timing", {}).get("entry_price")
+        timing = stock.get("timing") if isinstance(stock.get("timing"), dict) else {}
+        raw_entry_price = stock.get("entry_price") or timing.get("entry_price")
+        try:
+            entry_price = float(raw_entry_price)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+        if entry_price <= 0:
+            return {
+                "code": code,
+                "name": name,
+                "status": "error",
+                "reason": "缺少有效进场价，无法按统一口径计算推荐收益",
+                "data_date": "",
+                "target_date": target_date,
+                "return_basis": "missing_entry_price",
+                "evaluation_note": "已拒绝用当日涨跌幅替代推荐收益",
+            }
         try:
             target_return = float(stock.get("target_return_pct") or 0)
         except (TypeError, ValueError):
@@ -134,12 +150,8 @@ class Evaluator:
         change_pct = current_data.get("change_pct", 0)
         data_date = current_data.get("date", "")
 
-        # 计算收益率
-        if entry_price and entry_price > 0:
-            return_pct = calculate_return(entry_price, current_price)
-        else:
-            # 没有入场价，使用当日涨跌幅
-            return_pct = change_pct
+        # 推荐收益只能按推荐进场价到目标日收盘价计算，不能混用当日涨跌幅。
+        return_pct = calculate_return(entry_price, current_price)
 
         # 判断是否达标（含中间状态）
         is_hit = return_pct >= target_return
@@ -179,6 +191,7 @@ class Evaluator:
             "data_date": data_date,
             "target_date": target_date,
             "date_mismatch": date_mismatch,
+            "return_basis": "recommendation_entry_to_close",
             "evaluation_note": "数据日期与目标日期不一致" if date_mismatch else "按目标日期评估",
         }
     

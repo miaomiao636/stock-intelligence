@@ -12,6 +12,37 @@ from src.evaluation.evaluator import Evaluator
 from src.reporting.report_store import load_report
 
 
+def _build_account_summary() -> Dict:
+    """从模拟交易账本构建盘后账户结算快照。"""
+    from src.paper_trading.trading_service import TradingService
+
+    service = TradingService()
+    account = service.get_account()
+    positions = service.get_positions()
+    metrics = service.get_performance_metrics()
+
+    return {
+        "status": "ok",
+        "cash": float(account.get("cash") or 0),
+        "market_value": float(account.get("market_value") or 0),
+        "total_equity": float(
+            metrics.get("total_equity") or account.get("total_equity") or 0
+        ),
+        "effective_principal": float(
+            metrics.get("effective_principal") or account.get("adjusted_principal") or 0
+        ),
+        "total_return": float(metrics.get("net_return_after_costs") or 0),
+        "total_return_pct": float(metrics.get("net_return_after_costs_pct") or 0),
+        "realized_pnl": float(account.get("realized_pnl") or 0),
+        "unrealized_pnl": float(account.get("unrealized_pnl") or 0),
+        "max_drawdown_pct": float(metrics.get("max_drawdown_pct") or 0),
+        "position_count": len(positions),
+        "total_transaction_costs": float(metrics.get("total_transaction_costs") or 0),
+        "basis": "cash_flow_adjusted_after_fees_and_slippage",
+        "as_of": account.get("updated_at"),
+    }
+
+
 def run_closing_pipeline(
     dry_run: bool = False,
     force: bool = False,
@@ -23,6 +54,8 @@ def run_closing_pipeline(
     errors = []
     warnings = []
     source_status = {}
+    evaluator: Optional[Evaluator] = None
+    closing_report: Optional[Dict] = None
 
     # 1. 交易日历检查
     target_date = date.fromisoformat(today) if today else date.today()
@@ -92,23 +125,8 @@ def run_closing_pipeline(
     exit_alerts = []
     eval_status = evaluation.get("status", "unknown") if isinstance(evaluation, dict) else "error"
 
-    # 5.1 保存收盘报告到recommendations目录（Dashboard需要，无论评估状态如何都保存）
-    if not dry_run:
-        try:
-            from src.reporting.report_store import save_report
-            closing_report = dict(morning_report)
-            closing_report["type"] = "closing"
-            closing_report["evaluation"] = evaluation
-            closing_report["market_data"] = market_data
-            closing_report["created_at"] = datetime.now().isoformat()
-            save_report(closing_report, "closing")
-            source_status["closing_report"] = "ok"
-        except Exception as e:
-            warnings.append(f"盘后报告保存失败: {e}")
-            source_status["closing_report"] = "error"
-
-    # 5.2 保存完整评估结果（仅在评估成功/降级时）
-    if not dry_run and eval_status in ["success", "degraded"]:
+    # 5.1 保存完整评估结果（仅在评估成功/降级时）
+    if not dry_run and evaluator is not None and eval_status in ["success", "degraded"]:
         try:
             eval_file = evaluator.save_evaluation(evaluation)
             source_status["save"] = "ok"
@@ -175,6 +193,46 @@ def run_closing_pipeline(
             source_status["strategy_advisory"] = "error"
             warnings.append(f"策略建议生成失败: {e}")
 
+    # 9. 构建账户结算快照。必须在持仓盯市后读取，且历史补跑/干运行不得读取当前账本。
+    if dry_run:
+        account_summary = {
+            "status": "unavailable_dry_run",
+            "reason": "干运行不读取实时交易账本",
+        }
+        source_status["account_summary"] = "skipped_dry_run"
+    elif today != date.today().isoformat():
+        account_summary = {
+            "status": "unavailable_historical",
+            "reason": "历史补跑不得使用当前账户冒充历史账户快照",
+        }
+        source_status["account_summary"] = "skipped_historical_run"
+    else:
+        try:
+            account_summary = _build_account_summary()
+            source_status["account_summary"] = "ok"
+        except Exception as e:
+            account_summary = {"status": "error", "reason": str(e)}
+            source_status["account_summary"] = "error"
+            warnings.append(f"账户盘后结算读取失败: {e}")
+
+    # 10. 保存包含账户结算快照的收盘报告，供飞书与 Dashboard 使用。
+    if not dry_run:
+        try:
+            from src.reporting.report_store import save_report
+
+            closing_report = dict(morning_report)
+            closing_report["type"] = "closing"
+            closing_report["evaluation"] = evaluation
+            closing_report["market_data"] = market_data
+            closing_report["account_summary"] = account_summary
+            closing_report["warnings"] = list(warnings)
+            closing_report["created_at"] = datetime.now().isoformat()
+            save_report(closing_report, "closing")
+            source_status["closing_report"] = "ok"
+        except Exception as e:
+            warnings.append(f"盘后报告保存失败: {e}")
+            source_status["closing_report"] = "error"
+
     # 确定整体状态
     if errors:
         pipeline_status = "error"
@@ -200,6 +258,8 @@ def run_closing_pipeline(
         "evaluation_status": eval_status,
         "evaluation": evaluation,
         "market_data": market_data,
+        "account_summary": account_summary,
+        "report": closing_report or {},
         "source_status": source_status,
         "errors": errors,
         "warnings": warnings,

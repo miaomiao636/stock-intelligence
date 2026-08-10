@@ -42,6 +42,7 @@ def _format_report_notification(date_str: str, mode: str, report: dict, result: 
             market_data=result.get("market_data") or report.get("market_data", {}),
             evaluation=result.get("evaluation") or report.get("evaluation", {}),
             warnings=result.get("warnings") or report.get("warnings", []),
+            account_summary=result.get("account_summary") or report.get("account_summary", {}),
         )
 
     if mode == "afternoon":

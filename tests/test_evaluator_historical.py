@@ -116,6 +116,26 @@ def test_single_valid_recommendation_is_not_rejected_by_fixed_minimum(monkeypatc
     assert result["quality"]["min_valid_required"] == 1
 
 
+def test_missing_entry_price_is_not_replaced_by_daily_change(monkeypatch):
+    stock = {
+        "code": "000001",
+        "name": "测试",
+        "target_return_pct": 5.0,
+        "stop_loss_pct": -3.0,
+    }
+    monkeypatch.setattr(
+        evaluator_module,
+        "get_stock_data_on",
+        lambda *_: (_ for _ in ()).throw(AssertionError("missing entry must fail before price lookup")),
+    )
+
+    result = Evaluator()._evaluate_stock(stock, "2026-07-13")
+
+    assert result["status"] == "error"
+    assert result["return_basis"] == "missing_entry_price"
+    assert "拒绝用当日涨跌幅" in result["evaluation_note"]
+
+
 def test_leak_guard_rejects_evaluation_before_recommendation():
     result = validate_no_future_data(
         _recommendation(),

@@ -18,3 +18,7 @@ def test_win_rate_excludes_active_and_exposes_progress_separately():
     assert metrics["sample_coverage_pct"] == 50.0
     assert metrics["win_rate_pct"] == 50.0
     assert metrics["progress_score_pct"] != metrics["win_rate_pct"]
+    assert metrics["valid_recommendations"] == 4
+    assert metrics["winning_recommendations"] == 1
+    assert metrics["losing_recommendations"] == 1
+    assert metrics["return_basis"] == "recommendation_entry_to_close"
