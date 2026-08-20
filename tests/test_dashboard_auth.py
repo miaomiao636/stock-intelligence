@@ -68,22 +68,25 @@ def test_dashboard_labels_fallback_as_observation_and_can_retry_analysis():
     assert "apiFetch('/api/recommendation/regenerate'" in html
 
 
-def test_dashboard_uses_a_compact_collapsible_cockpit_without_storing_credentials():
+def test_dashboard_uses_sidebar_views_without_storing_credentials():
     html = DASHBOARD_HTML.read_text(encoding="utf-8")
 
-    assert 'class="primary-grid"' in html
-    assert 'class="secondary-grid"' in html
-    assert 'dashboardPanelStateV1' in html
-    assert "function togglePanel" in html
-    assert "function toggleAllPanels" in html
+    assert 'class="app-shell"' in html
+    assert 'class="sidebar"' in html
+    assert 'aria-label="功能导航"' in html
+    assert html.count('class="sidebar-nav-item') == 11
+    assert html.count('<section class="dashboard-view"') == 11
+    assert 'dashboardActiveViewV1' in html
+    assert "function navigateDashboard" in html
+    assert "function initializeDashboardNavigation" in html
     assert "function toggleRecommendationDetail" in html
     assert "slice(0, 3)" in html
-    assert 'aria-controls="panel-body-sectors"' in html
-    assert "const DEFAULT_PANEL_STATE = { sectors:false, news:false, control:false, asset:false, trades:false, tracking:false, weekly:false, history:false }" in html
-    assert ".primary-grid, .secondary-grid { grid-template-columns: 1fr; }" in html
-    assert "sessionStorage.setItem(PANEL_STATE_STORAGE, JSON.stringify(panelState))" in html
-    assert "apiKey" not in html.split("function persistPanelState", 1)[1].split(
-        "function togglePanel", 1
+    assert 'data-view-target="recommendations"' in html
+    assert 'data-view-target="control"' in html
+    assert '.app-shell.sidebar-open .sidebar' in html
+    assert "sessionStorage.setItem(DASHBOARD_VIEW_STORAGE, viewId)" in html
+    assert "apiKey" not in html.split("function navigateDashboard", 1)[1].split(
+        "function initializeDashboardNavigation", 1
     )[0]
 
 
