@@ -8,7 +8,7 @@
 
 - 本地正式仓库：`/Users/Admin/github-ai-tools/stock-intelligence`
 - 私有资料：`/Users/Admin/github-ai-tools/stock-intelligence-private`
-- GitHub：`https://github.com/kekcidbbe-sudo/stock-intelligence`
+- GitHub：`https://github.com/miaomiao636/stock-intelligence`
 - 云服务器代码：`/opt/stock-intelligence`
 - 云端运行数据：`/opt/stock-intelligence/data`
 
