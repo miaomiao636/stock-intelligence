@@ -2,21 +2,65 @@
 """Recommendation Tracker - tracks performance of historical recommendations"""
 
 import json
+import sqlite3
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+
+from src.data_collectors.trading_calendar import count_trading_days
+from src.utils.cost_calculator import calculate_trade_costs
 
 
 class RecommendationTracker:
     """Track and evaluate historical stock recommendations"""
 
-    TERMINAL_STATUSES = {"hit_target", "stopped_out", "deep_loss", "expired"}
+    TERMINAL_STATUSES = {
+        "hit_target",
+        "stopped_out",
+        "deep_loss",
+        "expired",
+        "entry_invalidated",
+        "expired_untriggered",
+    }
+    ENTERED_EXECUTION_STATUSES = {"filled", "theoretical_trigger"}
 
-    def __init__(self, data_dir: Path = None):
-        self.data_dir = data_dir or Path(__file__).parent.parent.parent / "data"
+    def __init__(self, data_dir: Path = None, execution_lookup: Callable = None):
+        self.data_dir = Path(data_dir or Path(__file__).parent.parent.parent / "data")
         self.tracker_dir = self.data_dir / "tracker"
         self.tracker_dir.mkdir(parents=True, exist_ok=True)
         self.recommendations_dir = self.data_dir / "recommendations"
+        self.execution_lookup = execution_lookup or self._lookup_filled_buy
+
+    def _lookup_filled_buy(self, recommendation_id: str, code: str) -> Optional[Dict]:
+        """Read the real buy fill without initializing or mutating the ledger."""
+        if not recommendation_id:
+            return None
+        db_path = self.data_dir / "stock_intelligence.db"
+        if not db_path.exists():
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    """
+                    SELECT o.order_id,o.recommendation_id,o.code,o.stop_price,o.target_price,
+                           o.instrument_type,t.trade_id,t.quantity,t.price AS fill_price,
+                           t.amount AS fill_amount,t.fees AS entry_fees,
+                           t.slippage AS entry_slippage,t.executed_at,t.trade_date
+                    FROM trading_orders o
+                    JOIN trading_trades t ON t.order_id=o.order_id
+                    WHERE o.recommendation_id=? AND o.code=?
+                      AND o.action='buy' AND o.status='filled'
+                    ORDER BY t.executed_at DESC LIMIT 1
+                    """,
+                    (recommendation_id, code),
+                ).fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return None
 
     @staticmethod
     def _number(value, default=0):
@@ -62,10 +106,10 @@ class RecommendationTracker:
         """Run daily tracking for all historical recommendations.
 
         For each historical recommendation:
-        1. Fetch current price for each stock
-        2. Compare against entry/target/stop-loss
-        3. Determine status: hit_target / stopped_out / active / expired
-        4. Record tracking data
+        1. Read the exact target-date OHLC, never today's quote for an older date
+        2. Prefer the ledger's actual fill; otherwise maintain an explicit trigger state
+        3. Compare against entry/target/stop-loss only after an entry exists
+        4. Record tracking data using trading-day holding periods
         """
         if date_str is None:
             date_str = date.today().isoformat()
@@ -82,6 +126,8 @@ class RecommendationTracker:
             if not rec_dir.is_dir():
                 continue
             rec_date = rec_dir.name
+            if rec_date > date_str:
+                continue
 
             # Load morning recommendation
             morning_file = rec_dir / "morning.json"
@@ -103,15 +149,22 @@ class RecommendationTracker:
                 if not self._is_actionable(stock):
                     excluded_non_actionable += 1
                     continue
-                track = self._track_stock(stock, rec_date, date_str)
-                key = f"{rec_date}:{track.get('code', '')}"
+                key = f"{rec_date}:{stock.get('code', '')}"
                 previous = previous_states.get(key)
                 if previous and previous.get("status") in self.TERMINAL_STATUSES:
                     # A terminal outcome is immutable. A later price must not
                     # turn a previous hit/stop back into an active sample.
                     track = dict(previous)
-                elif track.get("status") in self.TERMINAL_STATUSES:
-                    track["terminal_at"] = datetime.now().isoformat()
+                else:
+                    track = self._track_stock(
+                        stock,
+                        rec_date,
+                        date_str,
+                        previous=previous,
+                        recommendation=rec,
+                    )
+                    if track.get("status") in self.TERMINAL_STATUSES:
+                        track["terminal_at"] = datetime.now().isoformat()
                 all_tracks.append(track)
 
         # Save tracking results
@@ -127,107 +180,411 @@ class RecommendationTracker:
         self._save_tracking(result, date_str)
         return result
 
-    def _track_stock(self, stock: Dict, rec_date: str, today: str) -> Dict:
-        """Track a single stock recommendation"""
+    def _track_stock(
+        self,
+        stock: Dict,
+        rec_date: str,
+        today: str,
+        previous: Optional[Dict] = None,
+        recommendation: Optional[Dict] = None,
+    ) -> Dict:
+        """Track one recommendation from explicit execution and dated market data."""
         code = stock.get("code", "")
         name = stock.get("name", "")
         sector = stock.get("sector", "")
         action = stock.get("action", "")
-        entry_price = stock.get("entry_price", 0) or stock.get("timing", {}).get("entry_price", 0)
-        target_price = stock.get("target_price", 0) or stock.get("timing", {}).get("target_observation_price", 0)
-        stop_loss = stock.get("stop_loss_price", 0) or stock.get("timing", {}).get("stop_loss_price", 0)
+        timing = stock.get("timing") if isinstance(stock.get("timing"), dict) else {}
+        recommendation = recommendation or {}
+        previous = previous or {}
+        planned_entry_price = self._number(
+            stock.get("entry_price") or timing.get("entry_price") or stock.get("current_price"),
+            0,
+        )
+        planned_target_price = self._number(
+            stock.get("target_price") or timing.get("target_observation_price"),
+            0,
+        )
+        planned_stop_price = self._number(
+            stock.get("stop_loss_price") or timing.get("stop_loss_price"),
+            0,
+        )
         target_return = self._number(stock.get("target_return_pct"), 0)
         horizon = stock.get("horizon", "short")
-        horizon_days = int(self._number(stock.get("horizon_days"), 3) or 3)
+        horizon_days = max(1, int(self._number(stock.get("horizon_days"), 3) or 3))
 
-        # Fetch current price
-        current_price = self._fetch_price(code)
-        current_price_at_rec = stock.get("current_price", 0)
+        recommendation_id = stock.get("recommendation_id")
+        if not recommendation_id and recommendation.get("run_id"):
+            recommendation_id = f"REC-{recommendation['run_id']}-{code}"
+        execution = self.execution_lookup(recommendation_id, code) if recommendation_id else None
+        if execution and str(execution.get("trade_date") or "") > today:
+            execution = None
 
-        # If no entry_price in data, use current_price_at_rec or fetch it
-        if not entry_price or entry_price <= 0:
-            entry_price = current_price_at_rec or current_price or 0
-
-        # If still no target/stop-loss, compute from percentages
-        if entry_price > 0:
-            if not target_price or target_price <= 0:
-                if target_return > 0:
-                    target_price = round(entry_price * (1 + target_return / 100), 2)
-                else:
-                    target_price = round(entry_price * 1.05, 2)  # Default +5%
-            if not stop_loss or stop_loss <= 0:
-                sl_pct = abs(self._number(stock.get("stop_loss_pct"), 5))
-                stop_loss = round(entry_price * (1 - sl_pct / 100), 2)
-
-        # Calculate returns
-        actual_return_pct = 0
-        if entry_price and entry_price > 0 and current_price and current_price > 0:
-            actual_return_pct = round((current_price - entry_price) / entry_price * 100, 2)
-
-        # Calculate holding days
         try:
             rec_dt = date.fromisoformat(rec_date)
             today_dt = date.fromisoformat(today)
-            holding_days = (today_dt - rec_dt).days
-        except (ValueError, TypeError):
+        except (TypeError, ValueError):
+            return self._unscored_track(
+                stock=stock,
+                rec_date=rec_date,
+                today=today,
+                status="data_error",
+                execution_status="unknown",
+                planned_entry_price=planned_entry_price,
+                target_price=planned_target_price,
+                stop_price=planned_stop_price,
+                horizon=horizon,
+                horizon_days=horizon_days,
+                reason="推荐日期或跟踪日期格式无效",
+            )
+        tracking_age_days = max(0, count_trading_days(rec_dt, today_dt))
+
+        market_data = self._fetch_market_data(code, today)
+        if market_data.get("error") or market_data.get("date") != today:
+            reason = market_data.get("error") or (
+                f"行情日期{market_data.get('date') or '缺失'}与目标日期{today}不一致"
+            )
+            return self._unscored_track(
+                stock=stock,
+                rec_date=rec_date,
+                today=today,
+                status="data_error",
+                execution_status=("filled" if execution else previous.get("execution_status", "unknown")),
+                planned_entry_price=planned_entry_price,
+                target_price=planned_target_price,
+                stop_price=planned_stop_price,
+                horizon=horizon,
+                horizon_days=horizon_days,
+                reason=reason,
+                tracking_age_days=tracking_age_days,
+                data=market_data,
+                previous=previous,
+            )
+
+        day_open = self._number(market_data.get("open"), 0)
+        current_price = self._number(market_data.get("close"), 0)
+        day_high = self._number(market_data.get("high"), current_price)
+        day_low = self._number(market_data.get("low"), current_price)
+        if current_price <= 0 or day_high <= 0 or day_low <= 0:
+            return self._unscored_track(
+                stock=stock,
+                rec_date=rec_date,
+                today=today,
+                status="data_error",
+                execution_status=("filled" if execution else previous.get("execution_status", "unknown")),
+                planned_entry_price=planned_entry_price,
+                target_price=planned_target_price,
+                stop_price=planned_stop_price,
+                horizon=horizon,
+                horizon_days=horizon_days,
+                reason="目标日 OHLC 不完整或价格无效",
+                tracking_age_days=tracking_age_days,
+                data=market_data,
+                previous=previous,
+            )
+
+        entry_price = None
+        entry_date = None
+        target_price = planned_target_price
+        stop_price = planned_stop_price
+        execution_status = "unknown"
+        return_basis = "no_position_no_return"
+        order_id = None
+        trade_id = None
+        actual_return_pct = None
+
+        if execution:
+            entry_price = self._number(execution.get("fill_price"), 0)
+            entry_date = execution.get("trade_date")
+            target_price = self._number(execution.get("target_price"), target_price)
+            stop_price = self._number(execution.get("stop_price"), stop_price)
+            execution_status = "filled"
+            order_id = execution.get("order_id")
+            trade_id = execution.get("trade_id")
+        elif previous.get("execution_status") in self.ENTERED_EXECUTION_STATUSES:
+            entry_price = self._number(previous.get("entry_price"), 0)
+            entry_date = previous.get("entry_date") or rec_date
+            target_price = self._number(previous.get("target_price"), target_price)
+            stop_price = self._number(previous.get("stop_loss_price"), stop_price)
+            execution_status = previous["execution_status"]
+            order_id = previous.get("order_id")
+            trade_id = previous.get("trade_id")
+        elif rec_dt < today_dt and previous.get("execution_status") != "not_triggered":
+            return self._unscored_track(
+                stock=stock,
+                rec_date=rec_date,
+                today=today,
+                status="history_incomplete",
+                execution_status="unknown",
+                planned_entry_price=planned_entry_price,
+                target_price=target_price,
+                stop_price=stop_price,
+                horizon=horizon,
+                horizon_days=horizon_days,
+                reason="缺少此前逐日触发状态，不能用当前日线倒推出历史进场日",
+                tracking_age_days=tracking_age_days,
+                data=market_data,
+            )
+        else:
+            if planned_entry_price <= 0:
+                return self._unscored_track(
+                    stock=stock,
+                    rec_date=rec_date,
+                    today=today,
+                    status="data_error",
+                    execution_status="unknown",
+                    planned_entry_price=planned_entry_price,
+                    target_price=target_price,
+                    stop_price=stop_price,
+                    horizon=horizon,
+                    horizon_days=horizon_days,
+                    reason="缺少有效计划进场价",
+                    tracking_age_days=tracking_age_days,
+                    data=market_data,
+                )
+            lower = planned_entry_price * 0.99
+            upper = planned_entry_price * 1.005
+            if day_high < lower:
+                return self._unscored_track(
+                    stock=stock,
+                    rec_date=rec_date,
+                    today=today,
+                    status="entry_invalidated",
+                    execution_status="invalidated_gap_down",
+                    planned_entry_price=planned_entry_price,
+                    target_price=target_price,
+                    stop_price=stop_price,
+                    horizon=horizon,
+                    horizon_days=horizon_days,
+                    reason=(
+                        f"目标日最高价¥{day_high:.2f}仍低于安全下限¥{lower:.2f}，"
+                        "该推荐需重新评估，未视为成交"
+                    ),
+                    tracking_age_days=tracking_age_days,
+                    data=market_data,
+                )
+            if day_low > upper:
+                status = "expired_untriggered" if tracking_age_days > horizon_days * 2 else "not_triggered"
+                return self._unscored_track(
+                    stock=stock,
+                    rec_date=rec_date,
+                    today=today,
+                    status=status,
+                    execution_status="not_triggered",
+                    planned_entry_price=planned_entry_price,
+                    target_price=target_price,
+                    stop_price=stop_price,
+                    horizon=horizon,
+                    horizon_days=horizon_days,
+                    reason=(
+                        f"目标日最低价¥{day_low:.2f}未进入计划价安全上限¥{upper:.2f}"
+                    ),
+                    tracking_age_days=tracking_age_days,
+                    data=market_data,
+                )
+            reference_open = day_open if day_open > 0 else planned_entry_price
+            entry_price = round(max(lower, min(reference_open, upper)), 3)
+            entry_date = today
+            execution_status = "theoretical_trigger"
+
+        if not entry_price or entry_price <= 0 or not entry_date:
+            return self._unscored_track(
+                stock=stock,
+                rec_date=rec_date,
+                today=today,
+                status="data_error",
+                execution_status=execution_status,
+                planned_entry_price=planned_entry_price,
+                target_price=target_price,
+                stop_price=stop_price,
+                horizon=horizon,
+                horizon_days=horizon_days,
+                reason="成交记录缺少有效成交价或成交日期",
+                tracking_age_days=tracking_age_days,
+                data=market_data,
+            )
+
+        if target_price <= 0:
+            target_price = round(
+                entry_price * (1 + target_return / 100) if target_return > 0 else entry_price * 1.05,
+                2,
+            )
+        if stop_price <= 0:
+            stop_rate = abs(self._number(stock.get("stop_loss_pct"), 5)) / 100
+            stop_price = round(entry_price * (1 - stop_rate), 2)
+        if target_price > entry_price:
+            target_return = round((target_price / entry_price - 1) * 100, 2)
+
+        try:
+            entry_dt = date.fromisoformat(str(entry_date))
+            holding_days = max(0, count_trading_days(entry_dt, today_dt))
+        except (TypeError, ValueError):
             holding_days = 0
 
-        # Determine status
+        if execution_status == "filled":
+            quantity = int(self._number(execution.get("quantity"), 0))
+            exit_cost = calculate_trade_costs(
+                current_price * quantity,
+                "sell",
+                execution.get("instrument_type") or "stock",
+            )
+            exit_value = (
+                current_price * exit_cost["effective_price_factor"] * quantity
+                - exit_cost["fees"]
+            )
+            entry_value = self._number(execution.get("fill_amount"), entry_price * quantity)
+            entry_outlay = entry_value + self._number(execution.get("entry_fees"), 0)
+            actual_return_pct = round(
+                (exit_value - entry_outlay) / entry_outlay * 100 if entry_outlay > 0 else 0,
+                2,
+            )
+            return_basis = "actual_fill_to_close_after_estimated_exit_costs"
+        else:
+            actual_return_pct = round((current_price - entry_price) / entry_price * 100, 2)
+            return_basis = "theoretical_bar_trigger_to_close"
+
+        same_entry_day = str(entry_date) == today
+        target_touched = (
+            current_price >= target_price if same_entry_day else day_high >= target_price
+        ) if target_price > 0 else actual_return_pct >= target_return
+        stop_touched = (
+            current_price <= stop_price if same_entry_day else day_low <= stop_price
+        ) if stop_price > 0 else False
+        path_ambiguous = bool(not same_entry_day and target_touched and stop_touched)
         status = "active"
         failure_reason = ""
+        if path_ambiguous:
+            status = "path_ambiguous"
+            failure_reason = "同一日线同时触及止盈和止损，缺少分钟级路径，暂不判定输赢"
+        elif target_touched:
+            status = "hit_target"
+        elif stop_touched:
+            status = "stopped_out"
+            failure_reason = f"触发止损: 日内最低¥{day_low:.2f} ≤ 止损价¥{stop_price:.2f}"
+        elif holding_days > horizon_days * 2:
+            status = "expired"
+            if actual_return_pct < 0:
+                failure_reason = f"过期未达标: 持仓{holding_days}个交易日，收益{actual_return_pct}%"
+            else:
+                status = "active"
+        elif actual_return_pct <= -10:
+            status = "deep_loss"
+            failure_reason = f"深度亏损: 浮亏{actual_return_pct}%"
 
-        if current_price and current_price > 0:
-            # Check target hit
-            if target_price > 0 and current_price >= target_price:
-                status = "hit_target"
-            # Check stop-loss
-            elif stop_loss > 0 and current_price <= stop_loss:
-                status = "stopped_out"
-                failure_reason = f"触发止损: 现价¥{current_price:.2f} ≤ 止损价¥{stop_loss:.2f}"
-            elif target_return > 0 and actual_return_pct >= target_return:
-                status = "hit_target"
-            # Check expiry
-            elif holding_days > horizon_days * 2:
-                status = "expired"
-                if actual_return_pct < 0:
-                    failure_reason = f"过期未达标: 持仓{holding_days}天，收益{actual_return_pct}%"
-                else:
-                    status = "active"  # Keep tracking if profitable
-            # Deep loss
-            elif actual_return_pct <= -10:
-                status = "deep_loss"
-                failure_reason = f"深度亏损: 浮亏{actual_return_pct}%"
-
-        # 生成反馈分析
         feedback = self._generate_feedback(
             status, actual_return_pct, target_return, holding_days,
-            horizon_days, entry_price, current_price, target_price, stop_loss,
+            horizon_days, entry_price, current_price, target_price, stop_price,
             failure_reason, stock
         )
-
+        failed_statuses = {"stopped_out", "deep_loss", "expired"}
         return {
             "code": code,
             "name": name,
             "sector": sector,
             "action": action,
+            "recommendation_id": recommendation_id,
             "recommendation_date": rec_date,
+            "tracking_date": today,
+            "data_date": market_data.get("date", ""),
+            "data_source": market_data.get("_source", ""),
             "horizon": horizon,
             "horizon_days": horizon_days,
+            "planned_entry_price": planned_entry_price or None,
             "entry_price": entry_price,
+            "entry_date": str(entry_date),
             "target_price": target_price,
-            "stop_loss_price": stop_loss,
-            "current_price": current_price or 0,
+            "stop_loss_price": stop_price,
+            "current_price": current_price,
+            "day_open": day_open,
+            "day_high": day_high,
+            "day_low": day_low,
             "actual_return_pct": actual_return_pct,
             "target_return_pct": target_return,
             "holding_days": holding_days,
+            "tracking_age_days": tracking_age_days,
             "status": status,
+            "execution_status": execution_status,
+            "return_basis": return_basis,
+            "order_id": order_id,
+            "trade_id": trade_id,
+            "path_ambiguous": path_ambiguous,
             "failure_reason": failure_reason,
-            "is_met_expectation": status in ("hit_target",),
-            "is_failed": status in ("stopped_out", "deep_loss", "expired"),
-            "red_flag": status in ("stopped_out", "deep_loss", "expired"),  # 🔴红标
+            "is_met_expectation": status == "hit_target",
+            "is_failed": status in failed_statuses,
+            "red_flag": status in failed_statuses,
             "performance_grade": feedback["grade"],
             "feedback": feedback["analysis"],
             "adjustment_suggestion": feedback["suggestion"],
+            "recommendation_reason": stock.get("reason", ""),
+            "reason_news": stock.get("reason_news", ""),
+            "reason_policy": stock.get("reason_policy", ""),
+            "reason_technical": stock.get("reason_technical", ""),
+            "reason_fund": stock.get("reason_fund", ""),
+        }
+
+    def _unscored_track(
+        self,
+        *,
+        stock: Dict,
+        rec_date: str,
+        today: str,
+        status: str,
+        execution_status: str,
+        planned_entry_price: float,
+        target_price: float,
+        stop_price: float,
+        horizon: str,
+        horizon_days: int,
+        reason: str,
+        tracking_age_days: int = 0,
+        data: Optional[Dict] = None,
+        previous: Optional[Dict] = None,
+    ) -> Dict:
+        """Build a non-performance state without fabricating an entry return."""
+        data = data or {}
+        previous = previous or {}
+        entered_before_error = previous.get("execution_status") in self.ENTERED_EXECUTION_STATUSES
+        return {
+            "code": stock.get("code", ""),
+            "name": stock.get("name", ""),
+            "sector": stock.get("sector", ""),
+            "action": stock.get("action", ""),
+            "recommendation_id": stock.get("recommendation_id"),
+            "recommendation_date": rec_date,
+            "tracking_date": today,
+            "data_date": data.get("date", ""),
+            "data_source": data.get("_source", ""),
+            "horizon": horizon,
+            "horizon_days": horizon_days,
+            "planned_entry_price": planned_entry_price or None,
+            "entry_price": previous.get("entry_price") if entered_before_error else None,
+            "entry_date": previous.get("entry_date") if entered_before_error else None,
+            "target_price": (
+                previous.get("target_price") if entered_before_error else target_price or None
+            ),
+            "stop_loss_price": (
+                previous.get("stop_loss_price") if entered_before_error else stop_price or None
+            ),
+            "current_price": self._number(data.get("close"), 0) or None,
+            "day_open": self._number(data.get("open"), 0) or None,
+            "day_high": self._number(data.get("high"), 0) or None,
+            "day_low": self._number(data.get("low"), 0) or None,
+            "actual_return_pct": None,
+            "target_return_pct": self._number(stock.get("target_return_pct"), 0),
+            "holding_days": 0,
+            "tracking_age_days": tracking_age_days,
+            "status": status,
+            "execution_status": execution_status,
+            "return_basis": "no_position_no_return",
+            "order_id": previous.get("order_id") if entered_before_error else None,
+            "trade_id": previous.get("trade_id") if entered_before_error else None,
+            "path_ambiguous": False,
+            "failure_reason": reason,
+            "is_met_expectation": False,
+            "is_failed": False,
+            "red_flag": False,
+            "performance_grade": "N/A",
+            "feedback": reason,
+            "adjustment_suggestion": "等待真实成交或补齐逐日触发证据后再进入收益统计。",
             "recommendation_reason": stock.get("reason", ""),
             "reason_news": stock.get("reason_news", ""),
             "reason_policy": stock.get("reason_policy", ""),
@@ -279,6 +636,11 @@ class RecommendationTracker:
                 analysis = f"🔴 持仓到期且亏损{actual_return}%。{failure_reason}。"
                 suggestion = "到期止损离场。反思：horizon设置是否合理？市场状态是否误判？"
 
+        elif status == "path_ambiguous":
+            grade = "N/A"
+            analysis = f"⚪ {failure_reason}"
+            suggestion = "补充分钟级行情后再确定当日先触及止盈还是止损，当前样本不判输赢。"
+
         return {"grade": grade, "analysis": analysis, "suggestion": suggestion}
 
     def _calculate_summary(self, tracks: List[Dict]) -> Dict:
@@ -287,13 +649,25 @@ class RecommendationTracker:
             return {}
 
         total = len(tracks)
-        hit = sum(1 for t in tracks if t["status"] == "hit_target")
-        stopped = sum(1 for t in tracks if t["status"] == "stopped_out")
-        active = sum(1 for t in tracks if t["status"] == "active")
-        deep_loss = sum(1 for t in tracks if t["status"] == "deep_loss")
-        expired = sum(1 for t in tracks if t["status"] == "expired")
+        scoreable = [
+            t for t in tracks
+            if t.get("execution_status") in self.ENTERED_EXECUTION_STATUSES
+            and isinstance(t.get("actual_return_pct"), (int, float))
+        ]
+        valid_total = len(scoreable)
+        hit = sum(1 for t in scoreable if t.get("status") == "hit_target")
+        stopped = sum(1 for t in scoreable if t.get("status") == "stopped_out")
+        active = sum(1 for t in scoreable if t.get("status") == "active")
+        ambiguous = sum(1 for t in scoreable if t.get("status") == "path_ambiguous")
+        deep_loss = sum(1 for t in scoreable if t.get("status") == "deep_loss")
+        expired = sum(1 for t in scoreable if t.get("status") == "expired")
+        not_triggered = sum(1 for t in tracks if t.get("status") == "not_triggered")
+        entry_invalidated = sum(1 for t in tracks if t.get("status") == "entry_invalidated")
+        expired_untriggered = sum(1 for t in tracks if t.get("status") == "expired_untriggered")
+        history_incomplete = sum(1 for t in tracks if t.get("status") == "history_incomplete")
+        data_error = sum(1 for t in tracks if t.get("status") == "data_error")
 
-        returns = [t["actual_return_pct"] for t in tracks if t["actual_return_pct"] != 0]
+        returns = [float(t["actual_return_pct"]) for t in scoreable]
         avg_return = sum(returns) / len(returns) if returns else 0
 
         winners = [r for r in returns if r > 0]
@@ -303,12 +677,12 @@ class RecommendationTracker:
 
         failed = stopped + deep_loss + expired
         closed = hit + failed
-        pending = total - closed
+        pending = valid_total - closed
         win_rate = hit / closed * 100 if closed > 0 else 0
 
-        # Sector analysis
+        # Sector performance must never include recommendations without an entry.
         sector_stats = {}
-        for t in tracks:
+        for t in scoreable:
             s = t.get("sector", "未知")
             if s not in sector_stats:
                 sector_stats[s] = {"total": 0, "hit": 0, "failed": 0, "returns": []}
@@ -317,8 +691,7 @@ class RecommendationTracker:
                 sector_stats[s]["hit"] += 1
             if t["is_failed"]:
                 sector_stats[s]["failed"] += 1
-            if t["actual_return_pct"] != 0:
-                sector_stats[s]["returns"].append(t["actual_return_pct"])
+            sector_stats[s]["returns"].append(float(t["actual_return_pct"]))
 
         sector_summary = {}
         for s, data in sector_stats.items():
@@ -333,16 +706,26 @@ class RecommendationTracker:
 
         return {
             "total_tracked": total,
+            "valid_samples": valid_total,
             "hit_target": hit,
             "stopped_out": stopped,
             "active": active,
+            "path_ambiguous": ambiguous,
             "deep_loss": deep_loss,
             "expired": expired,
+            "not_triggered": not_triggered,
+            "entry_invalidated": entry_invalidated,
+            "expired_untriggered": expired_untriggered,
+            "history_incomplete": history_incomplete,
+            "data_error": data_error,
             "closed_samples": closed,
             "pending_samples": pending,
-            "sample_coverage_pct": round(closed / total * 100, 1) if total else 0,
+            "execution_coverage_pct": round(valid_total / total * 100, 1) if total else 0,
+            "sample_coverage_pct": round(closed / valid_total * 100, 1) if valid_total else 0,
+            "recommendation_closure_pct": round(closed / total * 100, 1) if total else 0,
             "win_rate_pct": round(win_rate, 1),
             "win_rate_basis": "closed_samples_only",
+            "return_basis": "entered_samples_only",
             "avg_return_pct": round(avg_return, 2),
             "avg_win_pct": round(avg_win, 2),
             "avg_loss_pct": round(avg_loss, 2),
@@ -411,12 +794,12 @@ class RecommendationTracker:
             if not week_tracks:
                 continue
 
-            # Deduplicate by code (keep latest)
+            # Deduplicate daily snapshots by recommendation identity. The same
+            # code may legitimately be recommended more than once in a week.
             seen = {}
             for t in week_tracks:
-                key = t.get("code", "")
-                if key not in seen or t.get("recommendation_date", "") > seen[key].get("recommendation_date", ""):
-                    seen[key] = t
+                key = f"{t.get('recommendation_date', '')}:{t.get('code', '')}"
+                seen[key] = t
             unique_tracks = list(seen.values())
 
             summary = self._calculate_summary(unique_tracks)
@@ -425,7 +808,15 @@ class RecommendationTracker:
             summary["week_label"] = f"{week_start.isoformat()} ~ {week_end.isoformat()}"
 
             # Top winners and losers
-            sorted_tracks = sorted(unique_tracks, key=lambda t: t.get("actual_return_pct", 0), reverse=True)
+            scored_tracks = [
+                t for t in unique_tracks
+                if isinstance(t.get("actual_return_pct"), (int, float))
+            ]
+            sorted_tracks = sorted(
+                scored_tracks,
+                key=lambda t: t.get("actual_return_pct", 0),
+                reverse=True,
+            )
             summary["top_winners"] = [
                 {"code": t["code"], "name": t["name"], "return_pct": t["actual_return_pct"]}
                 for t in sorted_tracks[:3] if t["actual_return_pct"] > 0
@@ -452,7 +843,7 @@ class RecommendationTracker:
 
         # Win rate check
         win_rate = summary.get("win_rate_pct", 0)
-        if win_rate < 50:
+        if summary.get("closed_samples", 0) > 0 and win_rate < 50:
             suggestions.append({
                 "type": "win_rate",
                 "priority": "high",
@@ -481,7 +872,7 @@ class RecommendationTracker:
 
         # Average return check
         avg_return = summary.get("avg_return_pct", 0)
-        if avg_return < 0:
+        if summary.get("valid_samples", 0) > 0 and avg_return < 0:
             suggestions.append({
                 "type": "negative_return",
                 "priority": "high",
@@ -490,14 +881,9 @@ class RecommendationTracker:
 
         return suggestions
 
-    def _fetch_price(self, code: str) -> Optional[float]:
-        """Fetch current price (B4: 复用统一接口)"""
+    def _fetch_market_data(self, code: str, target_date: str) -> Dict:
+        """Fetch exact-date OHLC and explicitly reject latest-price fallback."""
         if not code:
-            return None
-        from src.data_collectors.realtime_prices import fetch_single_price
-        price = fetch_single_price(code)
-        return price if price > 0 else None
-        """Save tracking results"""
-        track_file = self.tracker_dir / f"{date_str}.json"
-        with open(track_file, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+            return {"error": "missing_stock_code"}
+        from src.data_collectors.market_data import get_stock_data_on
+        return get_stock_data_on(code, target_date)
