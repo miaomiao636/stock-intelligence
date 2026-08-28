@@ -617,9 +617,15 @@ async def get_recommendations(limit: int = 30, with_tracking: bool = False):
                     enriched = dict(s)
                     if track:
                         enriched["tracking"] = {
-                            "current_price": track.get("current_price", 0),
-                            "actual_return_pct": track.get("actual_return_pct", 0),
+                            "current_price": track.get("current_price"),
+                            "planned_entry_price": track.get("planned_entry_price"),
+                            "entry_price": track.get("entry_price"),
+                            "entry_date": track.get("entry_date"),
+                            "actual_return_pct": track.get("actual_return_pct"),
                             "status": track.get("status", ""),
+                            "execution_status": track.get("execution_status", "unknown"),
+                            "return_basis": track.get("return_basis", ""),
+                            "data_date": track.get("data_date", ""),
                             "failure_reason": track.get("failure_reason", ""),
                             "is_met_expectation": track.get("is_met_expectation", False),
                             "is_failed": track.get("is_failed", False),

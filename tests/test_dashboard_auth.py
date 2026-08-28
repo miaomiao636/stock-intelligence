@@ -99,3 +99,14 @@ def test_dashboard_only_reports_server_confirmed_cash_and_strategy_saves():
     assert "服务器未确认价格上限" in html
     assert "_savePriceTimer" not in html
     assert "sessionStorage.setItem('maxStockPrice'" not in html
+
+
+def test_dashboard_distinguishes_unentered_recommendations_from_positions():
+    html = DASHBOARD_HTML.read_text(encoding="utf-8")
+
+    assert "执行覆盖" in html
+    assert "未触发" in html
+    assert "证据不足" in html
+    assert "const hasReturn = Number.isFinite(Number(t.actual_return_pct))" in html
+    assert "const entered = ['filled','theoretical_trigger'].includes(t.execution_status)" in html
+    assert "const closed = hitCount + failCount" in html

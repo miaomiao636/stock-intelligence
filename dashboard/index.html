@@ -1332,7 +1332,7 @@
 
             const summary = data.summary || {};
             const tracks = data.tracks || [];
-            setPanelSummary('tracking', `胜率 ${summary.win_rate_pct||0}% · 活跃 ${summary.active||0} · 止损 ${summary.stopped_out||0}`);
+            setPanelSummary('tracking', `胜率 ${summary.win_rate_pct||0}% · 执行覆盖 ${summary.execution_coverage_pct||0}% · 未触发 ${summary.not_triggered||0}`);
 
             // Grade colors
             const gradeColors = {'A':'#27ae60','B':'#2196f3','C':'#ff9800','D':'#e74c3c','F':'#b71c1c'};
@@ -1340,11 +1340,15 @@
 
             let h = '<div class="summary-grid">';
             h += '<div class="summary-stat"><div class="label">总跟踪</div><div class="value">' + (summary.total_tracked||0) + '</div></div>';
+            h += '<div class="summary-stat"><div class="label">有效进场</div><div class="value">' + (summary.valid_samples||0) + '</div></div>';
+            h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + (summary.execution_coverage_pct||0) + '%</div></div>';
             h += '<div class="summary-stat"><div class="label">已结束胜率</div><div class="value" style="color:' + ((summary.win_rate_pct||0)>=50?'#27ae60':'#e74c3c') + '">' + (summary.win_rate_pct||0) + '%</div></div>';
-            h += '<div class="summary-stat"><div class="label">样本覆盖</div><div class="value">' + (summary.sample_coverage_pct||0) + '%</div></div>';
+            h += '<div class="summary-stat"><div class="label">进场样本闭合</div><div class="value">' + (summary.sample_coverage_pct||0) + '%</div></div>';
             h += '<div class="summary-stat"><div class="label">达标</div><div class="value" style="color:#27ae60">' + (summary.hit_target||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">止损</div><div class="value" style="color:#e74c3c">' + (summary.stopped_out||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">活跃</div><div class="value" style="color:#2196f3">' + (summary.active||0) + '</div></div>';
+            h += '<div class="summary-stat"><div class="label">未触发</div><div class="value">' + (summary.not_triggered||0) + '</div></div>';
+            h += '<div class="summary-stat"><div class="label">证据不足</div><div class="value">' + ((summary.history_incomplete||0)+(summary.data_error||0)) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">平均收益</div><div class="value" style="color:' + ((summary.avg_return_pct||0)>=0?'#27ae60':'#e74c3c') + '">' + ((summary.avg_return_pct||0)>=0?'+':'') + (summary.avg_return_pct||0) + '%</div></div>';
             h += '</div>';
 
@@ -1353,11 +1357,15 @@
                 var grade = t.performance_grade || '?';
                 var gc = gradeColors[grade] || '#999';
                 var gb = gradeBg[grade] || '#f5f5f5';
-                var redFlag = t.red_flag ? '🔴 ' : (t.is_met_expectation ? '✅ ' : '🟡 ');
+                const entered = ['filled','theoretical_trigger'].includes(t.execution_status);
+                const hasReturn = Number.isFinite(Number(t.actual_return_pct)) && t.actual_return_pct !== null && t.actual_return_pct !== undefined;
+                var redFlag = t.red_flag ? '🔴 ' : (t.is_met_expectation ? '✅ ' : (entered ? '🟡 ' : '⚪ '));
                 var cardClass = t.red_flag ? 'track-card failed' : (t.is_met_expectation ? 'track-card hit' : 'track-card');
-                var ret = (t.actual_return_pct||0);
+                var ret = hasReturn ? Number(t.actual_return_pct) : null;
                 var retClass = ret >= 0 ? 'positive' : 'negative';
-                var statusText = t.status==='hit_target'?'达标':t.status==='stopped_out'?'止损':t.status==='deep_loss'?'深亏':t.status==='expired'?'过期':'活跃';
+                var statusLabels = {hit_target:'达标',stopped_out:'止损',deep_loss:'深亏',expired:'过期',active:'活跃',path_ambiguous:'路径不明',not_triggered:'未触发',entry_invalidated:'入场失效',expired_untriggered:'未触发到期',history_incomplete:'证据不足',data_error:'数据异常'};
+                var statusText = statusLabels[t.status] || esc(t.status||'未知');
+                var priceText = function(value) { return Number.isFinite(Number(value)) && value !== null ? '¥' + Number(value).toFixed(2) : '-'; };
 
                 var s = '<div class="' + cardClass + '">';
                 s += '<div class="track-header"><div>' + redFlag + '<span class="name">' + esc(t.name||'-') + '</span> ';
@@ -1365,10 +1373,11 @@
                 s += '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:' + gb + ';color:' + gc + ';font-weight:600;">' + grade + '</span>';
                 s += '</div>';
                 s += '<span class="status-tag" style="background:' + gb + ';color:' + gc + ';">' + statusText + '</span></div>';
-                s += '<div class="track-prices"><span>进场: ¥' + (t.entry_price||0).toFixed(2) + '</span>';
-                s += '<span>目标: ¥' + (t.target_price||0).toFixed(2) + '</span>';
-                s += '<span>现价: ¥' + (t.current_price||0).toFixed(2) + '</span>';
-                s += '<span class="' + retClass + '">收益: ' + (ret>=0?'+':'') + ret + '%</span></div>';
+                s += '<div class="track-prices"><span>' + (entered?'进场':'计划') + ': ' + priceText(entered?t.entry_price:t.planned_entry_price) + '</span>';
+                s += '<span>目标: ' + priceText(t.target_price) + '</span>';
+                s += '<span>收盘: ' + priceText(t.current_price) + '</span>';
+                s += hasReturn ? '<span class="' + retClass + '">收益: ' + (ret>=0?'+':'') + ret + '%</span>' : '<span>收益: 未计</span>';
+                s += '</div>';
                 if (t.feedback) s += '<div class="track-reason" style="color:' + gc + ';">' + esc(t.feedback) + '</div>';
                 if (t.adjustment_suggestion) s += '<div class="track-reason" style="font-size:11px;color:#666;margin-top:2px;">💡 ' + esc(t.adjustment_suggestion) + '</div>';
                 s += '</div>';
@@ -1391,12 +1400,27 @@
                 h += '</div>';
             }
 
-            // 🟡 Active (in progress)
-            var active = tracks.filter(function(t) { return !t.red_flag && !t.is_met_expectation; });
+            // 🟡 Entered and still in progress
+            var active = tracks.filter(function(t) { return ['filled','theoretical_trigger'].includes(t.execution_status) && !t.red_flag && !t.is_met_expectation; });
             if (active.length) {
                 h += '<div style="margin-bottom:10px;"><div style="font-weight:600;font-size:13px;color:#ff9800;margin-bottom:6px;">🟡 持仓观察中</div>';
                 active.slice(0,5).forEach(function(t) { h += renderTrackCard(t); });
                 if (active.length > 5) h += '<div style="font-size:12px;color:#999;text-align:center;padding:4px;">还有' + (active.length-5) + '只...</div>';
+                h += '</div>';
+            }
+
+            var unentered = tracks.filter(function(t) { return ['not_triggered','invalidated_gap_down'].includes(t.execution_status); });
+            if (unentered.length) {
+                h += '<div style="margin-bottom:10px;"><div style="font-weight:600;font-size:13px;color:#607d8b;margin-bottom:6px;">⚪ 尚未形成持仓</div>';
+                unentered.slice(0,5).forEach(function(t) { h += renderTrackCard(t); });
+                if (unentered.length > 5) h += '<div style="font-size:12px;color:#999;text-align:center;padding:4px;">还有' + (unentered.length-5) + '只...</div>';
+                h += '</div>';
+            }
+
+            var evidenceIssues = tracks.filter(function(t) { return ['history_incomplete','data_error'].includes(t.status); });
+            if (evidenceIssues.length) {
+                h += '<div style="margin-bottom:10px;"><div style="font-weight:600;font-size:13px;color:#607d8b;margin-bottom:6px;">⚪ 证据不足（不计胜率）</div>';
+                evidenceIssues.slice(0,5).forEach(function(t) { h += renderTrackCard(t); });
                 h += '</div>';
             }
 
@@ -1423,6 +1447,7 @@
                 h += '<div style="font-weight:600;font-size:14px;margin-bottom:8px;">📅 ' + esc(week.week_label||'') + '</div>';
                 h += '<div class="summary-grid">';
                 h += '<div class="summary-stat"><div class="label">跟踪数</div><div class="value">' + (week.total_tracked||0) + '</div></div>';
+                h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + (week.execution_coverage_pct||0) + '%</div></div>';
                 h += '<div class="summary-stat"><div class="label">已结束胜率</div><div class="value" style="color:' + winColor + '">' + (week.win_rate_pct||0) + '%</div></div>';
                 h += '<div class="summary-stat"><div class="label">平均收益</div><div class="value" style="color:' + retColor + '">' + ((week.avg_return_pct||0)>=0?'+':'') + (week.avg_return_pct||0) + '%</div></div>';
                 h += '<div class="summary-stat"><div class="label">达标/止损</div><div class="value"><span style="color:#27ae60">' + (week.hit_target||0) + '</span>/<span style="color:#e74c3c">' + (week.stopped_out||0) + '</span></div></div>';
@@ -1475,19 +1500,21 @@
             let h = '';
             data.slice(0, 10).forEach(function(item) {
                 const stocks = item.stocks || [];
-                let hitCount = 0, failCount = 0, activeCount = 0;
+                let hitCount = 0, failCount = 0, activeCount = 0, unenteredCount = 0;
                 stocks.forEach(function(s) {
                     const t = s.tracking;
                     if (t) {
-                        if (t.is_met_expectation) hitCount++;
+                        const entered = ['filled','theoretical_trigger'].includes(t.execution_status);
+                        if (!entered) unenteredCount++;
+                        else if (t.is_met_expectation) hitCount++;
                         else if (t.is_failed) failCount++;
                         else activeCount++;
                     }
                 });
 
-                const hasTracking = hitCount + failCount + activeCount > 0;
-                const total = hitCount + failCount + activeCount;
-                const winRate = hasTracking ? Math.round(hitCount / total * 100) : null;
+                const hasTracking = hitCount + failCount + activeCount + unenteredCount > 0;
+                const closed = hitCount + failCount;
+                const winRate = closed > 0 ? Math.round(hitCount / closed * 100) : null;
 
                 h += '<div class="history-item" data-hdate="' + esc(item.date||'') + '">';
                 h += '<div><span class="date">' + esc(item.date||'') + '</span>';
@@ -1495,11 +1522,16 @@
                 h += '<div style="display:flex;align-items:center;gap:8px;">';
 
                 if (hasTracking) {
-                    var winColor = winRate >= 50 ? '#27ae60' : '#e74c3c';
-                    h += '<span style="font-size:12px;padding:2px 8px;border-radius:3px;background:' + (winRate>=50?'#e8f5e9':'#ffeaea') + ';color:' + winColor + ';">胜率' + winRate + '%</span>';
+                    if (winRate !== null) {
+                        var winColor = winRate >= 50 ? '#27ae60' : '#e74c3c';
+                        h += '<span style="font-size:12px;padding:2px 8px;border-radius:3px;background:' + (winRate>=50?'#e8f5e9':'#ffeaea') + ';color:' + winColor + ';">已结束胜率' + winRate + '%</span>';
+                    } else {
+                        h += '<span style="font-size:12px;color:#888;">暂无闭合样本</span>';
+                    }
                     if (hitCount > 0) h += '<span style="font-size:11px;color:#27ae60;">✅' + hitCount + '</span>';
                     if (failCount > 0) h += '<span style="font-size:11px;color:#e74c3c;">❌' + failCount + '</span>';
                     if (activeCount > 0) h += '<span style="font-size:11px;color:#2196f3;">⏳' + activeCount + '</span>';
+                    if (unenteredCount > 0) h += '<span style="font-size:11px;color:#607d8b;">未进场' + unenteredCount + '</span>';
                 }
 
                 h += '<span style="font-size:12px;color:#999;">→</span></div></div>';

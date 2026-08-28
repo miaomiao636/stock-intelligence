@@ -2,6 +2,7 @@
 """API写入口和飞书回调的安全门禁。"""
 
 from fastapi.testclient import TestClient
+import json
 import yaml
 
 import server
@@ -186,6 +187,47 @@ def test_latest_quote_does_not_rewrite_historical_signal(monkeypatch):
     assert stock["target_price"] == 10.2
     assert stock["stop_loss_price"] == 9.4
     assert stock["latest_price"] == 10.5
+
+
+def test_recommendation_tracking_keeps_execution_truth_fields(tmp_path, monkeypatch):
+    rec_dir = tmp_path / "recommendations" / "2026-07-13"
+    tracker_dir = tmp_path / "tracker"
+    rec_dir.mkdir(parents=True)
+    tracker_dir.mkdir()
+    (rec_dir / "morning.json").write_text(
+        json.dumps({"stock_recommendations": [{"code": "000001", "name": "平安银行"}]}),
+        encoding="utf-8",
+    )
+    (tracker_dir / "2026-07-13.json").write_text(
+        json.dumps({
+            "tracks": [{
+                "code": "000001",
+                "recommendation_date": "2026-07-13",
+                "status": "not_triggered",
+                "execution_status": "not_triggered",
+                "return_basis": "no_position_no_return",
+                "planned_entry_price": 10.0,
+                "entry_price": None,
+                "actual_return_pct": None,
+                "data_date": "2026-07-13",
+                "is_met_expectation": False,
+                "is_failed": False,
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    client = TestClient(server.app)
+
+    response = client.get("/api/recommendations?with_tracking=true&limit=1")
+
+    assert response.status_code == 200
+    tracking = response.json()[0]["stocks"][0]["tracking"]
+    assert tracking["execution_status"] == "not_triggered"
+    assert tracking["return_basis"] == "no_position_no_return"
+    assert tracking["planned_entry_price"] == 10.0
+    assert tracking["entry_price"] is None
+    assert tracking["actual_return_pct"] is None
 
 
 def test_strategy_update_is_authenticated_validated_and_persisted(tmp_path, monkeypatch):
