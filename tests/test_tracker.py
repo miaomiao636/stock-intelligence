@@ -166,7 +166,9 @@ def test_tracker_does_not_invent_historical_entry_without_prior_state(tmp_path, 
     monkeypatch.setattr(
         tracker,
         "_fetch_market_data",
-        lambda code, target_date: _bar(target_date, close=10.5, low=9.8),
+        lambda code, target_date: (_ for _ in ()).throw(
+            AssertionError("history_incomplete must not fetch market data")
+        ),
     )
 
     result = tracker._track_stock(
@@ -178,6 +180,7 @@ def test_tracker_does_not_invent_historical_entry_without_prior_state(tmp_path, 
     assert result["status"] == "history_incomplete"
     assert result["execution_status"] == "unknown"
     assert result["actual_return_pct"] is None
+    assert result["data_date"] == ""
 
 
 def test_tracker_does_not_turn_incomplete_history_into_late_entry(tmp_path, monkeypatch):

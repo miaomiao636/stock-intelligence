@@ -237,6 +237,27 @@ class RecommendationTracker:
                 reason="推荐日期或跟踪日期格式无效",
             )
         tracking_age_days = max(0, count_trading_days(rec_dt, today_dt))
+        previous_execution_status = previous.get("execution_status")
+        trusted_previous_statuses = self.ENTERED_EXECUTION_STATUSES | {"not_triggered"}
+        if (
+            not execution
+            and rec_dt < today_dt
+            and previous_execution_status not in trusted_previous_statuses
+        ):
+            return self._unscored_track(
+                stock=stock,
+                rec_date=rec_date,
+                today=today,
+                status="history_incomplete",
+                execution_status="unknown",
+                planned_entry_price=planned_entry_price,
+                target_price=planned_target_price,
+                stop_price=planned_stop_price,
+                horizon=horizon,
+                horizon_days=horizon_days,
+                reason="缺少此前逐日触发状态，不能用当前日线倒推出历史进场日",
+                tracking_age_days=tracking_age_days,
+            )
 
         market_data = self._fetch_market_data(code, today)
         if market_data.get("error") or market_data.get("date") != today:
@@ -308,22 +329,6 @@ class RecommendationTracker:
             execution_status = previous["execution_status"]
             order_id = previous.get("order_id")
             trade_id = previous.get("trade_id")
-        elif rec_dt < today_dt and previous.get("execution_status") != "not_triggered":
-            return self._unscored_track(
-                stock=stock,
-                rec_date=rec_date,
-                today=today,
-                status="history_incomplete",
-                execution_status="unknown",
-                planned_entry_price=planned_entry_price,
-                target_price=target_price,
-                stop_price=stop_price,
-                horizon=horizon,
-                horizon_days=horizon_days,
-                reason="缺少此前逐日触发状态，不能用当前日线倒推出历史进场日",
-                tracking_age_days=tracking_age_days,
-                data=market_data,
-            )
         else:
             if planned_entry_price <= 0:
                 return self._unscored_track(

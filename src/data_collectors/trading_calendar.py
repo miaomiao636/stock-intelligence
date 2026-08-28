@@ -11,6 +11,24 @@ except ImportError:
     AKSHARE_AVAILABLE = False
 
 
+_TRADE_DATES_CACHE = None
+
+
+def _trade_dates():
+    """Load the exchange calendar once per day; retry after transient failures."""
+    global _TRADE_DATES_CACHE
+    cache_date = date.today()
+    if _TRADE_DATES_CACHE is not None and _TRADE_DATES_CACHE[0] == cache_date:
+        return _TRADE_DATES_CACHE[1]
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        trade_dates = set(df["trade_date"].astype(str).tolist())
+        _TRADE_DATES_CACHE = (cache_date, trade_dates)
+        return trade_dates
+    except Exception:
+        return None
+
+
 def is_trading_day(target_date: Optional[date] = None) -> bool:
     """检查是否是交易日"""
     if target_date is None:
@@ -20,14 +38,11 @@ def is_trading_day(target_date: Optional[date] = None) -> bool:
         # 简单判断：周一到周五
         return target_date.weekday() < 5
     
-    try:
-        # 获取交易日历
-        df = ak.tool_trade_date_hist_sina()
-        trade_dates = set(df["trade_date"].astype(str).tolist())
-        return target_date.strftime("%Y-%m-%d") in trade_dates
-    except Exception:
+    trade_dates = _trade_dates()
+    if trade_dates is None:
         # 降级：周一到周五
         return target_date.weekday() < 5
+    return target_date.strftime("%Y-%m-%d") in trade_dates
 
 
 def get_next_trading_day(target_date: Optional[date] = None) -> date:
