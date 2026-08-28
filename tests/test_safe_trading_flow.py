@@ -42,7 +42,7 @@ def proposed_buy(
         min_price=price * 0.99,
         max_price=price * 1.01,
         stop_price=price * 0.97,
-        target_price=price * 1.06,
+        target_price=price * 1.08,
         horizon="short",
         reason="测试信号",
     )
@@ -89,6 +89,29 @@ def test_system_auto_confirmation_has_no_waiting_window(service, open_time):
     assert confirmed["decision"] == "auto_execute"
     assert confirmed["decision_actor"] == "system_auto"
     assert result["success"] is True
+
+
+def test_cost_adjusted_reward_risk_gate_rejects_bad_buy(service, open_time):
+    order = service.propose_order(
+        run_id="low-reward-risk",
+        recommendation_id="REC-LOW-RR",
+        code="000099",
+        name="低盈亏比测试",
+        sector="测试",
+        action="buy",
+        quantity=100,
+        planned_price=10.0,
+        min_price=9.9,
+        max_price=10.1,
+        stop_price=9.7,
+        target_price=10.6,
+    )
+    service.confirm_automatically(order["order_id"])
+
+    result = service.execute_ready_order(order["order_id"], quote("000099", 10.0, open_time))
+
+    assert result["success"] is False
+    assert "成本后盈亏比" in result["error"]
 
 
 def test_no_action_becomes_executable_only_after_five_minutes(service, open_time):

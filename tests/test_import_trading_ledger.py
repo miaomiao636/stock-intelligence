@@ -40,7 +40,7 @@ def test_import_replaces_only_trading_ledger_and_creates_backup(tmp_path):
         min_price=9.9,
         max_price=10.1,
         stop_price=9.7,
-        target_price=10.6,
+        target_price=10.8,
     )
     source.confirm_automatically(order["order_id"])
     assert source.execute_ready_order(order["order_id"], _quote(now))["success"]

@@ -40,7 +40,7 @@ def test_trading_service_buy_is_idempotent_and_sell_is_t_plus_one(tmp_path):
         min_price=9.9,
         max_price=10.1,
         stop_price=9.7,
-        target_price=10.6,
+        target_price=10.8,
         reason="集成测试",
     )
     duplicate = service.propose_order(

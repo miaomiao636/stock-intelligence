@@ -11,6 +11,7 @@ from typing import Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from src.data_collectors.trading_calendar import count_trading_days
+from src.paper_trading.quality_gate import calculate_net_reward_risk
 from src.storage.trading_ledger import TradingLedger
 from src.strategy.position_limits import (
     get_cash_reserve_pct,
@@ -332,8 +333,29 @@ class TradingService:
         stop = order.get("stop_price")
         if not stop or stop >= price:
             return "买入订单缺少有效止损价"
-        exit_cost = calculate_trade_costs(stop * order["quantity"], "sell", order["instrument_type"])["total_cost"]
-        risk_amount = (price - stop) * order["quantity"] + exit_cost
+        target = order.get("target_price")
+        if not target or target <= price:
+            return "买入订单缺少有效目标价"
+        reward_risk = calculate_net_reward_risk(
+            entry_market_price=price,
+            target_market_price=float(target),
+            stop_market_price=float(stop),
+            quantity=int(order["quantity"]),
+            instrument_type=order["instrument_type"],
+        )
+        min_gross_ratio = float(config.get("min_gross_reward_risk_ratio", 2.0))
+        if reward_risk["gross_ratio"] + 1e-9 < min_gross_ratio:
+            return (
+                f"毛盈亏比{reward_risk['gross_ratio']:.2f}低于"
+                f"{min_gross_ratio:.2f}质量门"
+            )
+        min_net_ratio = float(config.get("min_net_reward_risk_ratio", 1.5))
+        if reward_risk["net_ratio"] + 1e-9 < min_net_ratio:
+            return (
+                f"成本后盈亏比{reward_risk['net_ratio']:.2f}低于"
+                f"{min_net_ratio:.2f}质量门"
+            )
+        risk_amount = reward_risk["net_risk"]
         account_risk = risk_amount / equity
         max_trade_risk_pct = float(config.get("max_trade_risk_pct", 0.0075))
         if account_risk > max_trade_risk_pct + 1e-9:

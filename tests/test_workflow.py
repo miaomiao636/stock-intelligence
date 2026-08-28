@@ -67,8 +67,11 @@ def test_0935_workflow_auto_executes_and_notifies(tmp_path, monkeypatch):
             "confidence": 4,
             "price_validation": {"verified": True},
             "current_price": 10,
+            "entry_price": 10,
             "stop_loss_price": 9.7,
+            "stop_loss_pct": -3,
             "target_price": 10.6,
+            "target_return_pct": 6,
             "horizon": "short",
             "reason": "测试",
         }],
@@ -187,8 +190,11 @@ def test_high_volatility_prefers_one_etf_and_caps_position_at_fifteen_percent(tm
                 "trade_eligible": True,
                 "confidence": 4,
                 "price_validation": {"verified": True},
+                "entry_price": 2.0,
                 "stop_loss_price": 1.94,
+                "stop_loss_pct": -3,
                 "target_price": 2.12,
+                "target_return_pct": 6,
             },
         ],
     }
@@ -217,12 +223,38 @@ def _tradeable_report(recommendation_id):
             "trade_eligible": True,
             "confidence": 4,
             "price_validation": {"verified": True},
+            "entry_price": 10,
             "stop_loss_price": 9.7,
+            "stop_loss_pct": -3,
             "target_price": 10.6,
+            "target_return_pct": 6,
             "horizon": "short",
             "reason": "测试",
         }],
     }
+
+
+def test_workflow_does_not_buy_before_planned_entry_is_triggered(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_TRADING_ENABLED", "true")
+    clock = {"now": datetime(2026, 7, 13, 9, 35, tzinfo=TZ)}
+    workflow = PaperTradingWorkflow(
+        tmp_path,
+        notifier=FakeNotifier(),
+        quote_fetcher=_quote_fetcher(clock),
+        now_provider=lambda: clock["now"],
+    )
+    workflow.service.initialize_account(20000)
+    report = _tradeable_report("REC-WAIT-ENTRY")
+    report["stock_recommendations"][0]["entry_price"] = 9.7
+
+    result = workflow.prepare_final_orders(
+        report,
+        {"llm": "success", "candidate_universe": "ok_50", "recommendation_prices": "ok_1"},
+    )
+
+    assert result["status"] == "no_orders"
+    assert "尚未进入计划价" in result["rejected"][0]["reason"]
+    assert workflow.service.ledger.list_orders() == []
 
 
 def _quote_fetcher(clock):
@@ -262,7 +294,7 @@ def test_due_order_is_rejected_when_callback_becomes_unreachable(tmp_path, monke
         min_price=9.9,
         max_price=10.1,
         stop_price=9.7,
-        target_price=10.6,
+        target_price=10.8,
     )
     order = workflow.service.mark_final_notified(order["order_id"], veto_minutes=5)
     order_id = order["order_id"]
@@ -300,7 +332,7 @@ def test_confirmed_order_executes_without_second_callback_probe(tmp_path, monkey
         min_price=9.9,
         max_price=10.1,
         stop_price=9.7,
-        target_price=10.6,
+        target_price=10.8,
     )
     order = workflow.service.mark_final_notified(order["order_id"], veto_minutes=5)
     order_id = order["order_id"]
@@ -349,13 +381,13 @@ def test_intraday_risk_exit_auto_executes_and_notifies(tmp_path, monkeypatch):
         min_price=9.9,
         max_price=10.1,
         stop_price=9.7,
-        target_price=10.6,
+        target_price=10.8,
     )
     workflow.service.confirm_automatically(buy["order_id"])
     assert workflow.service.execute_ready_order(buy["order_id"], fetch(["000001"])["000001"])["success"]
 
     clock["now"] = datetime(2026, 7, 14, 10, 5, tzinfo=TZ)
-    price["value"] = 10.7
+    price["value"] = 10.9
     result = workflow.intraday_check()
 
     assert result["status"] == "success"

@@ -10,6 +10,11 @@ from typing import Callable, Dict, List
 
 from src.data_collectors.realtime_prices import fetch_realtime_prices
 from src.notifier.feishu import FeishuNotifier
+from src.paper_trading.quality_gate import (
+    build_execution_levels,
+    entry_trigger_error,
+    resolve_stop_rate,
+)
 from src.paper_trading.trading_service import TradingService
 from src.strategy.position_limits import (
     get_cash_reserve_pct,
@@ -124,6 +129,10 @@ class PaperTradingWorkflow:
             if not _is_etf(stock) and price > get_max_stock_price():
                 rejected.append({"code": code, "reason": f"最新价¥{price:.2f}超过¥{get_max_stock_price():.0f}价格上限"})
                 continue
+            trigger_error = entry_trigger_error(stock, price, config)
+            if trigger_error:
+                rejected.append({"code": code, "reason": trigger_error})
+                continue
 
             account = self.service.get_account()
             positions = self.service.get_positions(trade_date)
@@ -157,7 +166,7 @@ class PaperTradingWorkflow:
                 equity * get_sector_limit(equity) - sector_exposure,
                 float(account["cash"]) - equity * reserve_pct,
             )
-            stop = float(stock.get("stop_loss_price") or stock.get("timing", {}).get("stop_loss_price") or price * 0.97)
+            stop = round(price * (1 - resolve_stop_rate(stock, config)), 3)
             instrument_type = "etf" if _is_etf(stock) else str(stock.get("instrument_type") or "stock")
             quantity = self._maximum_quantity(
                 price=price,
@@ -184,8 +193,21 @@ class PaperTradingWorkflow:
                     ),
                 })
                 continue
+            execution_levels = build_execution_levels(
+                stock=stock,
+                market_price=price,
+                quantity=quantity,
+                instrument_type=instrument_type,
+                config=config,
+            )
+            if not execution_levels.get("eligible"):
+                rejected.append({"code": code, "reason": execution_levels.get("reason")})
+                continue
             recommendation_id = stock.get("recommendation_id") or f"REC-{run_id}-{code}"
-            target = stock.get("target_price") or stock.get("timing", {}).get("target_observation_price")
+            timing = stock.get("timing") if isinstance(stock.get("timing"), dict) else {}
+            planned_entry = float(stock.get("entry_price") or timing.get("entry_price"))
+            trigger_tolerance = float(config.get("entry_trigger_tolerance_pct", 0.005))
+            max_gap_below = float(config.get("entry_max_gap_below_pct", 0.01))
             order = self.service.propose_order(
                 run_id=run_id,
                 recommendation_id=recommendation_id,
@@ -195,10 +217,10 @@ class PaperTradingWorkflow:
                 action="buy",
                 quantity=quantity,
                 planned_price=price,
-                min_price=round(price * 0.99, 3),
-                max_price=round(price * 1.01, 3),
-                stop_price=stop,
-                target_price=float(target or price * 1.06),
+                min_price=round(planned_entry * (1 - max_gap_below), 3),
+                max_price=round(planned_entry * (1 + trigger_tolerance), 3),
+                stop_price=execution_levels["stop_price"],
+                target_price=execution_levels["target_price"],
                 instrument_type=instrument_type,
                 horizon=horizon,
                 reason=stock.get("reason", ""),
