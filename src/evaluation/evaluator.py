@@ -2,20 +2,54 @@
 """评估器模块"""
 
 import json
+import sqlite3
 from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from src.data_collectors.market_data import get_stock_data_on, get_index_data_on
 from src.evaluation.metrics import calculate_return, calculate_metrics
 from src.evaluation.leak_guard import validate_no_future_data
+from src.utils.cost_calculator import calculate_trade_costs
 
 
 class Evaluator:
     """评估器"""
     
-    def __init__(self):
-        self.data_dir = Path(__file__).parent.parent.parent / "data"
+    def __init__(self, data_dir: Path = None, execution_lookup: Callable = None):
+        self.data_dir = Path(data_dir or Path(__file__).parent.parent.parent / "data")
+        self.execution_lookup = execution_lookup or self._lookup_filled_buy
+
+    def _lookup_filled_buy(self, recommendation_id: str, code: str) -> Optional[Dict]:
+        """只读查询推荐对应的真实买入成交；不存在账本时返回 None。"""
+        if not recommendation_id:
+            return None
+        db_path = self.data_dir / "stock_intelligence.db"
+        if not db_path.exists():
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    """
+                    SELECT o.order_id,o.recommendation_id,o.code,o.stop_price,o.target_price,
+                           o.instrument_type,t.trade_id,t.quantity,t.price AS fill_price,
+                           t.amount AS fill_amount,t.fees AS entry_fees,t.slippage AS entry_slippage,
+                           t.executed_at,t.trade_date
+                    FROM trading_orders o
+                    JOIN trading_trades t ON t.order_id=o.order_id
+                    WHERE o.recommendation_id=? AND o.code=?
+                      AND o.action='buy' AND o.status='filled'
+                    ORDER BY t.executed_at DESC LIMIT 1
+                    """,
+                    (recommendation_id, code),
+                ).fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return None
 
     @staticmethod
     def _is_actionable(stock: Dict) -> bool:
@@ -41,20 +75,26 @@ class Evaluator:
         actionable_stocks = [stock for stock in all_stocks if self._is_actionable(stock)]
 
         for stock in actionable_stocks:
-            result = self._evaluate_stock(stock, target_date)
+            result = self._evaluate_stock(stock, target_date, recommendation)
             stock_results.append(result)
         
         # 计算质量状态
         total = len(stock_results)
-        valid_results = [r for r in stock_results if r.get("status") != "error"]
+        valid_results = [
+            r for r in stock_results
+            if r.get("status") not in {"error", "not_triggered"}
+        ]
         error_results = [r for r in stock_results if r.get("status") == "error"]
+        not_triggered_results = [r for r in stock_results if r.get("status") == "not_triggered"]
         valid_count = len(valid_results)
         error_count = len(error_results)
+        not_triggered_count = len(not_triggered_results)
         error_rate = error_count / total if total > 0 else 0
         
-        # 小资金账户可能只产生1-2条高质量推荐，门槛不能高于当天实际推荐数。
-        min_valid_required = min(3, total) if total > 0 else 1
-        if valid_count < min_valid_required:
+        # 未触发计划价属于正常空仓结果，不应把 no-trade 日误报为评估故障。
+        scoreable_total = total - not_triggered_count - error_count
+        min_valid_required = min(3, scoreable_total) if scoreable_total > 0 else 0
+        if total > 0 and error_count == total:
             eval_status = "error"
         elif error_rate > 0.2:
             eval_status = "degraded"
@@ -81,6 +121,7 @@ class Evaluator:
                 "source_total": len(all_stocks),
                 "excluded_non_actionable": len(all_stocks) - total,
                 "valid": valid_count,
+                "not_triggered": not_triggered_count,
                 "error": error_count,
                 "error_rate": round(error_rate, 2),
                 "min_valid_required": min_valid_required,
@@ -100,18 +141,30 @@ class Evaluator:
             evaluation["status"] = "error"
         return evaluation
     
-    def _evaluate_stock(self, stock: Dict, target_date: str) -> Dict:
+    def _evaluate_stock(
+        self,
+        stock: Dict,
+        target_date: str,
+        recommendation: Dict = None,
+    ) -> Dict:
         """使用 target_date 的收盘数据评估单只股票。"""
 
         code = stock.get("code", "")
         name = stock.get("name", "")
+        recommendation = recommendation or {}
+        recommendation_id = stock.get("recommendation_id")
+        if not recommendation_id and recommendation.get("run_id"):
+            recommendation_id = f"REC-{recommendation['run_id']}-{code}"
+        execution = self.execution_lookup(recommendation_id, code) if recommendation_id else None
+        if execution and str(execution.get("trade_date") or "") > target_date:
+            execution = None
         timing = stock.get("timing") if isinstance(stock.get("timing"), dict) else {}
         raw_entry_price = stock.get("entry_price") or timing.get("entry_price")
         try:
-            entry_price = float(raw_entry_price)
+            planned_entry_price = float(raw_entry_price)
         except (TypeError, ValueError):
-            entry_price = 0.0
-        if entry_price <= 0:
+            planned_entry_price = 0.0
+        if planned_entry_price <= 0 and not execution:
             return {
                 "code": code,
                 "name": name,
@@ -150,12 +203,68 @@ class Evaluator:
         change_pct = current_data.get("change_pct", 0)
         data_date = current_data.get("date", "")
 
-        # 推荐收益只能按推荐进场价到目标日收盘价计算，不能混用当日涨跌幅。
-        return_pct = calculate_return(entry_price, current_price)
+        if execution:
+            entry_price = float(execution["fill_price"])
+            target_price = float(execution.get("target_price") or 0)
+            stop_price = float(execution.get("stop_price") or 0)
+            quantity = int(execution.get("quantity") or 0)
+            exit_cost = calculate_trade_costs(
+                current_price * quantity,
+                "sell",
+                execution.get("instrument_type") or "stock",
+            )
+            exit_value = (
+                current_price * exit_cost["effective_price_factor"] * quantity
+                - exit_cost["fees"]
+            )
+            entry_value = float(execution.get("fill_amount") or entry_price * quantity)
+            entry_outlay = entry_value + float(execution.get("entry_fees") or 0)
+            return_pct = (
+                (exit_value - entry_outlay) / entry_outlay * 100
+                if entry_outlay > 0 else 0.0
+            )
+            return_basis = "actual_fill_to_close_after_estimated_exit_costs"
+            execution_status = "filled"
+        else:
+            day_low = float(current_data.get("low") or 0)
+            if day_low > 0 and day_low > planned_entry_price:
+                return {
+                    "code": code,
+                    "name": name,
+                    "sector": stock.get("sector", ""),
+                    "action": stock.get("action", ""),
+                    "planned_entry_price": planned_entry_price,
+                    "current_price": current_price,
+                    "return_pct": None,
+                    "status": "not_triggered",
+                    "execution_status": "not_triggered",
+                    "change_pct": round(change_pct, 2),
+                    "data_date": data_date,
+                    "target_date": target_date,
+                    "date_mismatch": data_date != target_date if data_date else True,
+                    "return_basis": "no_position_no_return",
+                    "evaluation_note": (
+                        f"目标日最低价¥{day_low:.2f}未触及计划进场价¥{planned_entry_price:.2f}"
+                    ),
+                }
+            day_open = float(current_data.get("open") or 0)
+            entry_price = min(planned_entry_price, day_open) if day_open > 0 else planned_entry_price
+            target_price = float(
+                stock.get("target_price") or timing.get("target_observation_price") or 0
+            )
+            stop_price = float(stock.get("stop_loss_price") or timing.get("stop_loss_price") or 0)
+            return_pct = calculate_return(entry_price, current_price)
+            return_basis = "triggered_limit_entry_to_close"
+            execution_status = "theoretical_trigger"
+
+        if target_price > entry_price:
+            target_return = (target_price / entry_price - 1) * 100
+        if 0 < stop_price < entry_price:
+            stop_loss = (stop_price / entry_price - 1) * 100
 
         # 判断是否达标（含中间状态）
-        is_hit = return_pct >= target_return
-        is_stopped = return_pct <= stop_loss
+        is_hit = current_price >= target_price if target_price > 0 else return_pct >= target_return
+        is_stopped = current_price <= stop_price if stop_price > 0 else return_pct <= stop_loss
         is_near_target = return_pct >= target_return * 0.7 if target_return > 0 else False
         is_profitable = return_pct > 0
 
@@ -180,6 +289,7 @@ class Evaluator:
             "sector": stock.get("sector", ""),
             "action": stock.get("action", ""),
             "entry_price": entry_price,
+            "planned_entry_price": planned_entry_price or None,
             "current_price": current_price,
             "return_pct": round(return_pct, 2),
             "target_return_pct": target_return,
@@ -191,8 +301,15 @@ class Evaluator:
             "data_date": data_date,
             "target_date": target_date,
             "date_mismatch": date_mismatch,
-            "return_basis": "recommendation_entry_to_close",
-            "evaluation_note": "数据日期与目标日期不一致" if date_mismatch else "按目标日期评估",
+            "return_basis": return_basis,
+            "execution_status": execution_status,
+            "order_id": execution.get("order_id") if execution else None,
+            "trade_id": execution.get("trade_id") if execution else None,
+            "evaluation_note": (
+                "数据日期与目标日期不一致"
+                if date_mismatch
+                else "按实际成交与成本评估" if execution else "计划价已触发，按理论限价成交评估"
+            ),
         }
     
     def save_evaluation(self, evaluation: Dict) -> Path:

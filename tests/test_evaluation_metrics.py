@@ -21,4 +21,15 @@ def test_win_rate_excludes_active_and_exposes_progress_separately():
     assert metrics["valid_recommendations"] == 4
     assert metrics["winning_recommendations"] == 1
     assert metrics["losing_recommendations"] == 1
-    assert metrics["return_basis"] == "recommendation_entry_to_close"
+    assert metrics["return_basis"] == "execution_aligned_to_close"
+
+
+def test_not_triggered_recommendation_is_excluded_from_returns():
+    metrics = calculate_metrics([
+        {"status": "not_triggered", "return_pct": None},
+        {"status": "hit", "return_pct": 5.0},
+    ])
+
+    assert metrics["valid_recommendations"] == 1
+    assert metrics["not_triggered_recommendations"] == 1
+    assert metrics["avg_return_pct"] == 5.0

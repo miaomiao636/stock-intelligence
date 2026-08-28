@@ -50,7 +50,9 @@ def calculate_win_rate(results: list) -> float:
 
 def calculate_progress_score(results: list) -> float:
     """进行中表现分，仅用于观察进度，不得标记为胜率。"""
-    valid_results = [r for r in results if r.get("status") != "error"]
+    valid_results = [
+        r for r in results if r.get("status") not in {"error", "not_triggered"}
+    ]
     if not valid_results:
         return 0.0
 
@@ -92,8 +94,10 @@ def calculate_metrics(
 ) -> Dict:
     """计算综合指标"""
     
-    # 过滤掉status=error的记录
-    valid_results = [r for r in stock_results if r.get("status") != "error"]
+    # 未触发进场价的推荐没有持仓收益，不得用 0% 污染收益和胜率。
+    valid_results = [
+        r for r in stock_results if r.get("status") not in {"error", "not_triggered"}
+    ]
     
     # 提取收益率
     returns = [r.get("return_pct", 0) for r in valid_results]
@@ -131,8 +135,11 @@ def calculate_metrics(
         "benchmark_return_pct": round(benchmark_return, 2),
         "win_rate_pct": round(win_rate, 2),
         "win_rate_basis": "closed_samples_only",
-        "return_basis": "recommendation_entry_to_close",
+        "return_basis": "execution_aligned_to_close",
         "valid_recommendations": len(valid_results),
+        "not_triggered_recommendations": sum(
+            1 for r in stock_results if r.get("status") == "not_triggered"
+        ),
         "closed_recommendations": len(closed_results),
         "winning_recommendations": winning_count,
         "losing_recommendations": losing_count,
