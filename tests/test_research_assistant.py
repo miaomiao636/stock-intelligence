@@ -52,4 +52,3 @@ def test_model_failure_is_safe_and_does_not_retry_cost(tmp_path):
     result = assistant.answer("分析", {}, mode="experts", request_id="failed-1")
     assert "secret-api-key" not in str(result)
     assert result["mode"] == "facts_fallback"
-
