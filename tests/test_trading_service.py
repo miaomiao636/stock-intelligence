@@ -83,6 +83,8 @@ def test_trading_service_buy_is_idempotent_and_sell_is_t_plus_one(tmp_path):
     assert sold["success"] is True
     assert service.get_positions() == []
     assert sold["trade"]["realized_pnl"] is not None
+    assert sold["trade"]["realized_pnl"] == pytest.approx(service.get_account()["cash"] - 20000)
+    assert service.get_trade_accounting()["summary"]["realized_pnl"] == sold["trade"]["realized_pnl"]
 
 
 def test_performance_uses_live_net_equity_costs_and_initial_peak(tmp_path):

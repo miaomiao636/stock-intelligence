@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from contextlib import closing
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -12,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from src.data_collectors.trading_calendar import count_trading_days
 from src.paper_trading.quality_gate import calculate_net_reward_risk
+from src.paper_trading.trade_accounting import calculate_fifo_accounting
 from src.storage.trading_ledger import TradingLedger
 from src.strategy.position_limits import (
     get_cash_reserve_pct,
@@ -49,7 +51,21 @@ class TradingService:
         return self.ledger.initialize_account(initial_cash or get_initial_cash(), reset=reset)
 
     def get_account(self) -> Dict:
-        return self.ledger.get_account()
+        account = self.ledger.get_account()
+        summary = self.get_trade_accounting()["summary"]
+        account["legacy_realized_pnl"] = account["realized_pnl"]
+        account["realized_pnl"] = summary["realized_pnl"]
+        account["accounting_status"] = summary["accounting_status"]
+        account["unrealized_pnl"] = round(account["unrealized_pnl"] - summary["unallocated_buy_fees"], 2)
+        return account
+
+    def get_trade_accounting(self) -> Dict:
+        """All-history FIFO, with both-side fees; no LIMIT and no writes."""
+        with closing(self.ledger.connect()) as conn:
+            trades = [dict(row) for row in conn.execute(
+                "SELECT * FROM trading_trades ORDER BY executed_at, rowid"
+            )]
+        return calculate_fifo_accounting(trades)
 
     def update_available_cash(self, cash: float) -> Dict:
         return self.ledger.update_available_cash(cash)
@@ -424,7 +440,10 @@ class TradingService:
                 )
             else:
                 lots = conn.execute(
-                    "SELECT * FROM position_lots WHERE code=? AND quantity>0 AND (instrument_type!='stock' OR acquired_date<?) ORDER BY acquired_date,lot_id",
+                    "SELECT l.*, t.fees AS buy_fees, t.amount AS buy_amount, t.quantity AS buy_quantity "
+                    "FROM position_lots l JOIN trading_trades t ON t.trade_id=l.buy_trade_id "
+                    "WHERE l.code=? AND l.quantity>0 AND (l.instrument_type!='stock' OR l.acquired_date<?) "
+                    "ORDER BY t.executed_at,t.rowid",
                     (order["code"], now.date().isoformat()),
                 ).fetchall()
                 remaining = order["quantity"]
@@ -433,7 +452,7 @@ class TradingService:
                     used = min(remaining, lot["quantity"])
                     if not used:
                         continue
-                    cost_basis += used * lot["avg_cost"]
+                    cost_basis += used * ((lot["buy_amount"] + lot["buy_fees"]) / lot["buy_quantity"])
                     conn.execute("UPDATE position_lots SET quantity=quantity-?,updated_at=? WHERE lot_id=?", (used, now.isoformat(), lot["lot_id"]))
                     remaining -= used
                     if remaining == 0:
@@ -531,11 +550,10 @@ class TradingService:
             peak = max(peak, value)
             if peak > 0:
                 max_drawdown = max(max_drawdown, (peak - value) / peak * 100)
-        trades = self.ledger.list_trades(limit=1000)
+        accounting = self.get_trade_accounting()
+        trades = accounting["trades"]
         total_fees = round(sum(float(t.get("fees") or 0) for t in trades), 2)
         total_slippage = round(sum(float(t.get("slippage") or 0) for t in trades), 2)
-        closed_trades = [t for t in trades if t.get("action") == "sell" and t.get("realized_pnl") is not None]
-        winning_trades = sum(1 for t in closed_trades if float(t["realized_pnl"]) > 0)
         net_return = round(current - current_principal, 2)
         net_return_pct = round((current / current_principal - 1) * 100, 4)
         return {
@@ -551,8 +569,11 @@ class TradingService:
             "total_fees": total_fees,
             "total_slippage": total_slippage,
             "total_transaction_costs": round(total_fees + total_slippage, 2),
-            "closed_trades": len(closed_trades),
-            "trade_win_rate_pct": round(winning_trades / len(closed_trades) * 100, 2) if closed_trades else 0,
+            "closed_trades": accounting["summary"]["closed_trades"],
+            "trade_win_rate_pct": accounting["summary"]["win_rate_pct"],
+            "realized_pnl": accounting["summary"]["realized_pnl"],
+            "accounting_status": accounting["summary"]["accounting_status"],
+            "unmatched_sells": accounting["summary"]["unmatched_sells"],
             "cost_basis": "fees_and_slippage_included",
         }
 

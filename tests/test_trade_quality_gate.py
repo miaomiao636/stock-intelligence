@@ -27,7 +27,7 @@ def test_entry_trigger_requires_the_planned_price_zone():
     assert "缺少有效计划进场价" in entry_trigger_error({}, 10.0, CONFIG)
 
 
-def test_execution_levels_raise_target_until_cost_adjusted_ratio_passes():
+def test_execution_levels_reject_inadequate_target_without_raising_it():
     levels = build_execution_levels(
         stock={"entry_price": 10.0, "stop_loss_pct": -3, "target_return_pct": 6},
         market_price=10.0,
@@ -36,17 +36,32 @@ def test_execution_levels_raise_target_until_cost_adjusted_ratio_passes():
         config=CONFIG,
     )
 
-    assert levels["eligible"] is True
+    assert levels["eligible"] is False
     assert levels["stop_price"] == pytest.approx(9.7)
-    assert levels["target_price"] > 10.6
-    assert levels["gross_reward_risk_ratio"] >= 2.0
-    assert levels["net_reward_risk_ratio"] >= 1.5
+    assert levels["target_price"] == pytest.approx(10.6)
+    assert levels["net_reward_risk_ratio"] < 1.5
+    assert "成本后盈亏比" in levels["reason"]
 
-    metrics = calculate_net_reward_risk(
-        entry_market_price=10.0,
-        target_market_price=levels["target_price"],
-        stop_market_price=levels["stop_price"],
+def test_execution_levels_preserve_explicit_target_instead_of_rebasing_it():
+    levels = build_execution_levels(
+        stock={"entry_price": 10, "target_price": 10.9, "target_return_pct": 20},
+        market_price=10.04,
         quantity=100,
         instrument_type="stock",
+        config=CONFIG,
     )
-    assert metrics["net_ratio"] >= 1.5
+    assert levels["eligible"] is True
+    assert levels["target_price"] == 10.9
+
+def test_execution_levels_do_not_invent_a_missing_target():
+    levels = build_execution_levels(stock={"entry_price": 10}, market_price=10,
+                                    quantity=100, instrument_type="stock", config=CONFIG)
+    assert levels["eligible"] is False
+    assert "目标" in levels["reason"]
+
+
+@pytest.mark.parametrize("field,value", [("target_price", float("nan")), ("target_price", float("inf")), ("target_return_pct", -8)])
+def test_execution_levels_reject_non_finite_or_negative_target(field, value):
+    levels = build_execution_levels(stock={"entry_price": 10, field: value}, market_price=10,
+                                    quantity=100, instrument_type="stock", config=CONFIG)
+    assert levels["eligible"] is False

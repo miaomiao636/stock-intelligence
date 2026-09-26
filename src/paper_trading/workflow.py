@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import os
+import json
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Dict, List
 
 from src.data_collectors.realtime_prices import fetch_realtime_prices
+from src.data_collectors.trading_calendar import count_trading_days, is_trading_day
+from src.paper_trading.entry_plans import EntryPlanStore, PENDING, TERMINAL
 from src.notifier.feishu import FeishuNotifier
 from src.paper_trading.quality_gate import (
     build_execution_levels,
@@ -55,22 +58,180 @@ class PaperTradingWorkflow:
         self.service = TradingService(data_dir, now_provider=now_provider)
         self.notifier = notifier or FeishuNotifier()
         self.quote_fetcher = quote_fetcher or fetch_realtime_prices
+        self.entry_plans = EntryPlanStore(self.service.ledger)
 
     @staticmethod
     def enabled() -> bool:
         return os.getenv("PAPER_TRADING_ENABLED", "false").lower() == "true"
 
-    def prepare_final_orders(self, report: Dict, source_status: Dict = None) -> Dict:
+    @staticmethod
+    def _source_error(source_status):
+        if source_status.get("llm") != "success":
+            return "LLM或数据降级，禁止开仓"
+        if not str(source_status.get("candidate_universe", "")).startswith("ok_"):
+            return "全市场候选池未通过，禁止开仓"
+        if not str(source_status.get("recommendation_prices", "")).startswith("ok_"):
+            return "推荐价格未全部通过真实行情校验，禁止开仓"
+        return None
+
+    def _context_error(self, report, source_status):
+        now = self.service.now()
+        if not self.enabled():
+            return "PAPER_TRADING_ENABLED=false"
+        if not is_trading_day(now.date()):
+            return "非交易日，禁止开仓"
+        if not self.service._is_market_session(now):
+            return "不在连续交易时段，等待下一可交易时点"
+        if not report or report.get("date") != now.date().isoformat():
+            return "当天研究报告缺失或已过期，禁止沿用旧计划"
+        if report.get("analysis_degraded") is True:
+            return "研究报告处于降级状态，禁止开仓"
+        if report.get("type") == "afternoon":
+            if (source_status.get("llm") != "success"
+                    or source_status.get("market_data") != "ok"
+                    or source_status.get("morning_report") != "ok"
+                    or not str(source_status.get("realtime_prices", "")).startswith("ok_")):
+                return "盘中复核数据降级或缺失，禁止开仓"
+            return None
+        return self._source_error(source_status)
+
+    @staticmethod
+    def _plan_changed(stock, original):
+        keys = ("entry_price", "target_price", "stop_loss_price", "target_return_pct", "stop_loss_pct", "timing", "horizon")
+        return any(stock.get(key) != original.get(key) for key in keys)
+
+    @staticmethod
+    def _candidate_error(stock, regime):
+        if not stock.get("code"):
+            return "缺少证券代码"
+        if stock.get("action") != "setup_ready" or stock.get("trade_eligible") is not True:
+            return "推荐仅供观察，未通过交易资格"
+        if stock.get("price_validation", {}).get("verified") is not True:
+            return "推荐价格未经核验"
+        if float(stock.get("confidence") or 0) < float(get_paper_trading_config().get("min_trade_confidence", 4)):
+            return "推荐置信度不足"
+        policy = get_regime_limits(regime)
+        if not (policy.get("allow_etfs", True) if _is_etf(stock) else policy.get("allow_stocks", True)):
+            return f"{regime}市场禁止该类标的新开仓"
+        if policy.get("defensive_only") and not _is_defensive(stock):
+            return f"{regime}市场仅允许防御候选"
+        return None
+
+    def prepare_final_orders(self, report: Dict, source_status: Dict = None, notify: bool = True) -> Dict:
+        """保存每个候选及未成交原因；未到价的计划保留到当日收盘。"""
+        if not self.enabled():
+            return {"status": "disabled", "orders": [], "reason": "PAPER_TRADING_ENABLED=false"}
+        sources = source_status if source_status is not None else report.get("source_status", {})
+        now = self.service.now()
+        run_id = report.get("run_id") or f"{now.date().isoformat()}-open"
+        plans = []
+        for stock in report.get("stock_recommendations", []):
+            plan = self.entry_plans.register(stock, run_id=run_id, trade_date=now.date().isoformat(), now=now,
+                                             source_status=sources)
+            if self._plan_changed(stock, plan["stock"]):
+                self.entry_plans.update(plan["plan_id"], "rejected", "同一研究标识的计划已变更，原计划失效", now)
+                plan["status"] = "rejected"
+            plans.append(plan)
+        # Registering a newer same-code plan may supersede a row already in this
+        # batch; use persisted states rather than the stale registration return.
+        requested_ids = {plan["plan_id"] for plan in plans}
+        plans = [plan for plan in self.entry_plans.list_plans(now.date().isoformat(), limit=None)
+                 if plan["plan_id"] in requested_ids]
+        if not plans:
+            source_error = self._source_error(sources)
+            return {"status": "safe_mode" if source_error else "no_orders", "orders": [], "rejected": [],
+                    "reason": source_error or f"{report.get('market_regime', 'neutral')}市场下没有满足当前仓位与质量规则的候选"}
+        return self._process_plans(plans, report, sources, notify=notify)
+
+    def _process_plans(self, plans, report, sources, notify=False):
+        now = self.service.now()
+        self.entry_plans.reconcile_fills(now)
+        requested_ids = {plan["plan_id"] for plan in plans}
+        plans = [plan for plan in self.entry_plans.list_plans(limit=None) if plan["plan_id"] in requested_ids]
+        context_error = self._context_error(report, sources)
+        eligible, rejected = [], []
+        for plan in plans:
+            if plan["status"] in TERMINAL:
+                continue
+            expired = now >= datetime.fromisoformat(plan["expires_at"])
+            reason = "计划已于当日收盘到期，禁止跨日追单" if expired else context_error
+            if not reason:
+                reason = self._source_error(plan["stock"].get("_entry_source_status", {}))
+            if not reason:
+                reason = self._candidate_error(plan["stock"], report.get("market_regime", "neutral"))
+            if reason:
+                status = "expired" if expired else "rejected"
+                if not expired and reason == "不在连续交易时段，等待下一可交易时点":
+                    status = plan["status"]
+                self.entry_plans.update(plan["plan_id"], status, reason, now)
+                rejected.append({"code": plan["code"], "reason": reason})
+            else:
+                eligible.append(plan)
+        if not eligible:
+            return {"status": "safe_mode" if context_error else "no_orders", "orders": [],
+                    "rejected": rejected, "reason": context_error or "没有待触发的合格计划"}
+        # Keep original run/recommendation identities across newer reports and restarts.
+        # Process as one group to retain candidate ranking and daily policy limits.
+        execution_report = dict(report, stock_recommendations=[dict(p["stock"], _plan_run_id=p["run_id"]) for p in eligible])
+        result = self._execute_report(execution_report, sources, notify=notify)
+        reasons = {item["code"]: item["reason"] for item in result.get("rejected", [])}
+        orders = {order["code"]: order for order in result.get("orders", [])}
+        for plan in eligible:
+            if plan["code"] in orders:
+                self.entry_plans.update(plan["plan_id"], "filled", "通过复核并模拟成交", now, orders[plan["code"]]["order_id"])
+                continue
+            reason = reasons.get(plan["code"]) or result.get("reason") or "本轮扫描或当日开仓额度已用尽"
+            status = "waiting_trigger" if "尚未进入计划价" in reason else "rejected"
+            if any(word in reason for word in ("行情不可用", "行情已过期", "行情获取失败")):
+                status = "waiting_quote"
+            self.entry_plans.update(plan["plan_id"], status, reason, now)
+            if plan["code"] not in reasons:
+                result.setdefault("rejected", []).append({"code": plan["code"], "reason": reason})
+        result.setdefault("rejected", []).extend(rejected)
+        self.entry_plans.reconcile_fills(now)
+        result["entry_plan_summary"] = self.entry_plans.get_summary(now.date().isoformat())
+        return result
+
+    def recheck_entry_plans(self, report: Dict = None, source_status: Dict = None, notify: bool = False) -> Dict:
+        """Revalidate pending plans, using today's latest report; no messages by default."""
+        plans = self.entry_plans.list_plans(limit=None, statuses=sorted(PENDING))
+        if not plans:
+            return {"status": "no_orders", "orders": [], "reason": "没有待触发计划"}
+        if report is None:
+            directory = self.service.data_dir / "recommendations" / self.service.now().date().isoformat()
+            for report_type in ("afternoon", "morning"):
+                path = directory / f"{report_type}.json"
+                if path.exists():
+                    try:
+                        report = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        report = None
+                    break  # A broken newer report must not silently fall back to bullish old evidence.
+        report = report or {}
+        sources = source_status if source_status is not None else report.get("source_status", {})
+        # A current downgrade/removal invalidates the old setup, not its original identity.
+        current = {stock.get("code"): stock for stock in report.get("stock_recommendations", [])}
+        for plan in plans:
+            stock = current.get(plan["code"])
+            if stock and report.get("type") == "afternoon" and stock.get("decision_scope") == "advisory_only":
+                # Afternoon cannot grant buy authority. It can only leave an
+                # already-authorized original setup intact or veto that setup.
+                advisory_ok = stock.get("afternoon_decision") in {"maintain", "upgrade"} and not stock.get("degraded_reason")
+                stock = dict(stock, trade_eligible=plan["stock"].get("trade_eligible") if advisory_ok else False)
+            if report and (stock is None or self._candidate_error(stock, report.get("market_regime", "neutral"))):
+                self.entry_plans.update(plan["plan_id"], "rejected", "最新研究已撤回或降级该候选", self.service.now())
+            elif stock:
+                # New research may lower its target while still marking setup_ready.
+                # Do not quietly trade the more optimistic archived target/entry.
+                if self._plan_changed(stock, plan["stock"]):
+                    self.entry_plans.update(plan["plan_id"], "rejected", "最新研究计划价格或周期已变更，原计划失效", self.service.now())
+        plans = self.entry_plans.list_plans(limit=None, statuses=sorted(PENDING))
+        return self._process_plans(plans, report, sources, notify=notify)
+
+    def _execute_report(self, report: Dict, source_status: Dict = None, notify: bool = True) -> Dict:
         """用09:35行情重算，通过风控后立即模拟成交并推送结果。"""
         if not self.enabled():
             return {"status": "disabled", "orders": [], "reason": "PAPER_TRADING_ENABLED=false"}
-        source_status = source_status or {}
-        if source_status.get("llm") in {"fallback", "error", "degraded"}:
-            return {"status": "safe_mode", "orders": [], "reason": "LLM或数据降级，禁止开仓"}
-        if not str(source_status.get("candidate_universe", "")).startswith("ok_"):
-            return {"status": "safe_mode", "orders": [], "reason": "全市场候选池未通过，禁止开仓"}
-        if not str(source_status.get("recommendation_prices", "")).startswith("ok_"):
-            return {"status": "safe_mode", "orders": [], "reason": "推荐价格未全部通过真实行情校验，禁止开仓"}
         regime = report.get("market_regime", "neutral")
         config = get_paper_trading_config()
         policy = get_regime_limits(regime)
@@ -98,7 +259,10 @@ class PaperTradingWorkflow:
                 "reason": f"{regime}市场下没有满足当前仓位与质量规则的候选",
             }
         codes = [stock.get("code") for stock in candidates if stock.get("code")]
-        quotes = self.quote_fetcher(codes)
+        try:
+            quotes = self.quote_fetcher(codes)
+        except Exception:
+            return {"status": "no_orders", "orders": [], "reason": "行情获取失败，本轮禁止成交"}
         account = self.service.get_account()
         self.service.record_equity_snapshot(account["total_equity"], at=self.service.now().isoformat())
         run_id = report.get("run_id") or f"{self.service.now().date().isoformat()}-open"
@@ -122,6 +286,10 @@ class PaperTradingWorkflow:
         for stock in candidates:
             code = stock.get("code")
             quote = quotes.get(code) or {}
+            quote_error = self.service._validate_quote({"code": code}, quote, self.service.now())
+            if quote_error:
+                rejected.append({"code": code, "reason": quote_error})
+                continue
             price = float(quote.get("price") or 0)
             if price <= 0:
                 rejected.append({"code": code, "reason": "09:35行情不可用"})
@@ -208,8 +376,11 @@ class PaperTradingWorkflow:
             planned_entry = float(stock.get("entry_price") or timing.get("entry_price"))
             trigger_tolerance = float(config.get("entry_trigger_tolerance_pct", 0.005))
             max_gap_below = float(config.get("entry_max_gap_below_pct", 0.01))
+            if self.service.ledger.is_day_paused(trade_date):
+                rejected.append({"code": code, "reason": "今日模拟交易已由用户暂停"})
+                continue
             order = self.service.propose_order(
-                run_id=run_id,
+                run_id=stock.get("_plan_run_id") or run_id,
                 recommendation_id=recommendation_id,
                 code=code,
                 name=stock.get("name") or code,
@@ -224,6 +395,7 @@ class PaperTradingWorkflow:
                 instrument_type=instrument_type,
                 horizon=horizon,
                 reason=stock.get("reason", ""),
+                idempotency_key=f"entry:{trade_date}:{code}",
             )
             if order["status"] in {"proposed", "pre_notified"}:
                 order = self.service.confirm_automatically(order["order_id"])
@@ -245,12 +417,13 @@ class PaperTradingWorkflow:
                 detail = result.get("error") or "自动执行失败"
                 title = "模拟订单自动执行失败"
                 rejected.append({"code": code, "reason": detail})
-            notification_results.append(
-                self.notifier.send_message(
-                    title,
-                    f"{order['name']}（{order['code']}）\n状态：{status}\n{detail}",
+            if notify:
+                notification_results.append(
+                    self.notifier.send_message(
+                        title,
+                        f"{order['name']}（{order['code']}）\n状态：{status}\n{detail}",
+                    )
                 )
-            )
             if not result.get("success"):
                 continue
             prepared.append(final)
@@ -355,13 +528,14 @@ class PaperTradingWorkflow:
             self.notifier.send_message(f"模拟订单结果：{status}", f"{order['name']}（{order['code']}）\n{detail}")
         return {"status": "success", "results": results}
 
-    def intraday_check(self) -> Dict:
+    def intraday_check(self, report: Dict = None, source_status: Dict = None, notify: bool = True) -> Dict:
         """每30分钟盯市；无状态变化不推送。"""
         if not self.enabled():
             return {"status": "disabled", "positions": 0, "alerts": []}
+        entry_recheck = self.recheck_entry_plans(report=report, source_status=source_status, notify=False)
         positions = self.service.get_positions()
         if not positions:
-            return {"status": "success", "positions": 0, "alerts": []}
+            return {"status": "success", "positions": 0, "alerts": [], "entry_recheck": entry_recheck}
         quotes = self.quote_fetcher([p["code"] for p in positions])
         prices = {code: float(info["price"]) for code, info in quotes.items() if info.get("price")}
         self.service.ledger.update_market_prices(prices, self.service.now())
@@ -390,9 +564,9 @@ class PaperTradingWorkflow:
                     horizons = (yaml.safe_load(handle) or {}).get("horizons", {})
                 max_days = horizons.get(position.get("horizon", "short"), {}).get("max_days")
                 if max_days and position.get("entry_date"):
-                    held_days = (date.fromisoformat(self.service.now().date().isoformat()) - date.fromisoformat(position["entry_date"])).days
+                    held_days = count_trading_days(date.fromisoformat(position["entry_date"]), self.service.now().date())
                     if held_days >= int(max_days):
-                        reason = f"达到{position.get('horizon', 'short')}周期最长持有{max_days}天"
+                        reason = f"达到{position.get('horizon', 'short')}周期最长持有{max_days}个交易日"
             if reason:
                 if position["available_quantity"] <= 0:
                     alerts.append(f"{position['name']} {reason}，但受T+1限制，下一可卖时点处理")
@@ -428,6 +602,6 @@ class PaperTradingWorkflow:
                                 f"{position['name']} {reason}，自动卖出失败："
                                 f"{result.get('error') or (final or {}).get('reject_reason') or '未知原因'}"
                             )
-        if alerts:
+        if alerts and notify:
             self.notifier.send_message("盘中风险变化", "\n".join(f"- {a}" for a in alerts))
-        return {"status": "success", "positions": len(positions), "alerts": alerts, "metrics": metrics}
+        return {"status": "success", "positions": len(positions), "alerts": alerts, "metrics": metrics, "entry_recheck": entry_recheck}

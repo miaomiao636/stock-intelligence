@@ -11,7 +11,8 @@ from src.utils.cost_calculator import calculate_trade_costs
 
 def _number(value, default: float = 0.0) -> float:
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else default
     except (TypeError, ValueError):
         return default
 
@@ -99,19 +100,21 @@ def build_execution_levels(
     instrument_type: str,
     config: Dict,
 ) -> Dict:
-    """以待成交行情重算止损/目标，确保成本后盈亏比达到质量门。"""
+    """检验原始研究目标，绝不抬高目标价来凑足盈亏比。"""
     stop_rate = resolve_stop_rate(stock, config)
     stop_price = round(market_price * (1 - stop_rate), 3)
-    requested_target_rate = _rate(stock.get("target_return_pct"), 0.06)
+    timing = stock.get("timing") if isinstance(stock.get("timing"), dict) else {}
+    planned_entry = _number(stock.get("entry_price") or timing.get("entry_price"))
+    target_price = _number(stock.get("target_price") or timing.get("target_price"))
+    if not target_price and stock.get("target_return_pct") is not None and planned_entry > 0:
+        if _number(stock["target_return_pct"]) <= 0:
+            return {"eligible": False, "reason": "目标收益必须是有效正值"}
+        target_price = planned_entry * (1 + _rate(stock["target_return_pct"], 0))
+    if target_price <= market_price or market_price <= 0:
+        return {"eligible": False, "reason": "缺少有效研究目标价或目标已低于当前价", "target_price": target_price}
     min_gross_ratio = max(0.0, _number(config.get("min_gross_reward_risk_ratio"), 2.0))
     min_net_ratio = max(0.0, _number(config.get("min_net_reward_risk_ratio"), 1.5))
-    max_target_rate = max(
-        requested_target_rate,
-        _number(config.get("max_target_return_pct"), 0.15),
-    )
-
-    initial_rate = max(requested_target_rate, stop_rate * min_gross_ratio)
-    target_price = market_price * (1 + initial_rate)
+    max_target_rate = _number(config.get("max_target_return_pct"), 0.15)
     metrics = calculate_net_reward_risk(
         entry_market_price=market_price,
         target_market_price=target_price,
@@ -119,56 +122,16 @@ def build_execution_levels(
         quantity=quantity,
         instrument_type=instrument_type,
     )
-
-    if metrics["net_ratio"] < min_net_ratio:
-        low, high = target_price, market_price * (1 + max_target_rate)
-        high_metrics = calculate_net_reward_risk(
-            entry_market_price=market_price,
-            target_market_price=high,
-            stop_market_price=stop_price,
-            quantity=quantity,
-            instrument_type=instrument_type,
-        )
-        if high_metrics["net_ratio"] < min_net_ratio:
-            return {
-                "eligible": False,
-                "reason": (
-                    f"在最高{max_target_rate*100:.1f}%目标内，成本后盈亏比"
-                    f"{high_metrics['net_ratio']:.2f}仍低于{min_net_ratio:.2f}"
-                ),
-            }
-        for _ in range(40):
-            middle = (low + high) / 2
-            middle_metrics = calculate_net_reward_risk(
-                entry_market_price=market_price,
-                target_market_price=middle,
-                stop_market_price=stop_price,
-                quantity=quantity,
-                instrument_type=instrument_type,
-            )
-            if middle_metrics["net_ratio"] >= min_net_ratio:
-                high = middle
-            else:
-                low = middle
-        target_price = high
-        metrics = calculate_net_reward_risk(
-            entry_market_price=market_price,
-            target_market_price=target_price,
-            stop_market_price=stop_price,
-            quantity=quantity,
-            instrument_type=instrument_type,
-        )
-
-    target_price = math.ceil(target_price * 1000) / 1000
-    metrics = calculate_net_reward_risk(
-        entry_market_price=market_price,
-        target_market_price=target_price,
-        stop_market_price=stop_price,
-        quantity=quantity,
-        instrument_type=instrument_type,
-    )
+    reason = None
+    if target_price / market_price - 1 > max_target_rate + 1e-9:
+        reason = "研究目标超出允许的目标收益范围，需重新评估"
+    elif metrics["gross_ratio"] + 1e-9 < min_gross_ratio:
+        reason = f"原始目标毛盈亏比{metrics['gross_ratio']:.2f}低于{min_gross_ratio:.2f}"
+    elif metrics["net_ratio"] + 1e-9 < min_net_ratio:
+        reason = f"原始目标成本后盈亏比{metrics['net_ratio']:.2f}低于{min_net_ratio:.2f}"
     return {
-        "eligible": True,
+        "eligible": reason is None,
+        "reason": reason,
         "entry_price": round(market_price, 3),
         "stop_price": stop_price,
         "target_price": target_price,

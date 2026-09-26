@@ -55,6 +55,7 @@ def test_0935_workflow_auto_executes_and_notifies(tmp_path, monkeypatch):
     )
     workflow.service.initialize_account(20000)
     report = {
+        "date": "2026-07-13",
         "run_id": "2026-07-13-morning",
         "market_regime": "bullish",
         "stock_recommendations": [{
@@ -166,6 +167,7 @@ def test_high_volatility_prefers_one_etf_and_caps_position_at_fifteen_percent(tm
     )
     workflow.service.initialize_account(20000)
     report = {
+        "date": "2026-07-13",
         "run_id": "2026-07-13-high-volatility",
         "market_regime": "high_volatility",
         "stock_recommendations": [
@@ -212,6 +214,7 @@ def test_high_volatility_prefers_one_etf_and_caps_position_at_fifteen_percent(tm
 
 def _tradeable_report(recommendation_id):
     return {
+        "date": "2026-07-13",
         "run_id": recommendation_id,
         "market_regime": "bullish",
         "stock_recommendations": [{
