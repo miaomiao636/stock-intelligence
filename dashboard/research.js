@@ -37,6 +37,39 @@
         target.replaceChildren(block);
     }
     function busy(target, value) { target.setAttribute('aria-busy', String(value)); }
+    function fold(title, className = 'research-fold') {
+        const details = element('details', className);
+        details.append(element('summary', '', title));
+        return details;
+    }
+    // Page only the returned snapshot; never imply that 30/100 loaded rows are all history.
+    function paged(target, items, size, renderItem, scope) {
+        let page = 0;
+        const pages = Math.max(1, Math.ceil(items.length / size));
+        const rows = element('div', 'research-paged-items');
+        const nav = element('nav', 'research-pagination');
+        nav.setAttribute('aria-label', '记录分页');
+        const previous = element('button', 'btn btn-sm', '上一页');
+        const next = element('button', 'btn btn-sm', '下一页');
+        const count = element('span');
+        count.setAttribute('role', 'status');
+        for (const button of [previous, next]) {
+            button.type = 'button';
+            button.setAttribute('aria-label', button.textContent);
+        }
+        nav.append(previous, count, next);
+        target.replaceChildren(element('p', 'research-list-scope', scope), rows, nav);
+        function render() {
+            rows.replaceChildren(...items.slice(page * size, (page + 1) * size).map(renderItem));
+            rows.scrollTop = 0;
+            count.textContent = `第 ${page + 1} / ${pages} 页 · ${items.length} 条`;
+            previous.disabled = page === 0;
+            next.disabled = page === pages - 1;
+        }
+        previous.addEventListener('click', () => { if (page > 0) { page--; render(); } });
+        next.addEventListener('click', () => { if (page + 1 < pages) { page++; render(); } });
+        render();
+    }
     function timestamp(value) {
         const raw = text(value);
         // Backend timestamps without an offset are China-market local times, not browser local times.
@@ -45,8 +78,13 @@
             ? normalized + '+08:00' : normalized;
         const parsed = Date.parse(withZone);
         const stale = Number.isFinite(parsed) && Date.now() - parsed > 48 * 60 * 60 * 1000;
-        return element('span', `research-time${stale ? ' is-stale' : ''}`,
-            `资料截止：${raw || '时间未提供'}${stale ? ' · 资料时间较早，请先核对新信息' : ''}`);
+        const display = Number.isFinite(parsed) ? new Intl.DateTimeFormat('zh-CN', {
+            timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hourCycle:'h23'
+        }).format(new Date(parsed)) + ' 北京时间' : raw || '时间未提供';
+        const node = element('span', `research-time${stale ? ' is-stale' : ''}`,
+            `资料截止：${display}${stale ? ' · 资料时间较早' : ''}`);
+        node.title = raw;
+        return node;
     }
     function limitations(parent, values) {
         const notes = list(values).filter(Boolean);
@@ -118,7 +156,9 @@
                 card.append(element('span', '', name), element('strong', '', count));
                 grid.append(card);
             });
-            target.append(grid, timestamp(data.data_as_of), element('span', 'research-time', `快照查询时间：${text(data.as_of) || '未提供'}（不代表行情或证据已更新）`));
+            target.append(grid, timestamp(data.data_as_of));
+            const context = fold('数据说明、入场计划与限制');
+            context.append(element('span', 'research-time', `快照查询时间：${text(data.as_of) || '未提供'}（不代表行情或证据已更新）`));
             const plans = data.entry_plans;
             const planPanel = element('details', 'research-plan-summary');
             planPanel.append(element('summary', '', '入场计划 · 为什么还未成交？'));
@@ -137,9 +177,10 @@
                     planPanel.append(ul);
                 }
             }
-            target.append(planPanel);
+            context.append(planPanel);
             if (data.available === false) target.append(element('p', 'research-state', '暂无可用研究档案，当前不能据此判断策略是否有效。'));
-            limitations(target, data.limitations);
+            limitations(context, data.limitations);
+            target.append(context);
         } catch (error) { if (seq === sequences.research) failure(target, error); }
         finally { if (seq === sequences.research) busy(target, false); }
     }
@@ -158,25 +199,26 @@
             if (seq !== sequences.judgments) return;
             const items = itemsFrom(data);
             if (!items.length) { empty(target, '暂无判断记录', '对应股票尚未留下可回放的研究判断；不会用今天的信息补写历史。'); return; }
-            target.replaceChildren();
-            items.forEach(item => {
+            let selectedId = null;
+            paged(target, items, 6, item => {
                 const button = element('button', 'research-judgment-button');
                 button.type = 'button';
-                button.setAttribute('aria-pressed', 'false');
-                button.append(element('strong', '', `${text(item.stock_name) || '未命名股票'} ${text(item.stock_code)}`),
-                    element('span', 'research-badge', label(item.status)), timestamp(item.as_of),
-                    element('p', 'research-excerpt', text(item.thesis).slice(0, 140) || '未记录判断摘要'));
-                if (item.history_incomplete) button.append(element('span', 'research-badge is-warning', '历史证据不足'));
+                button.setAttribute('aria-pressed', String(item.id === selectedId));
+                const heading = element('div', 'research-summary-line');
+                heading.append(element('strong', '', `${text(item.stock_name) || '未命名股票'} ${text(item.stock_code)}`),
+                    element('span', `research-badge${item.history_incomplete ? ' is-warning' : ''}`, label(item.history_incomplete ? 'history_incomplete' : item.status)));
+                button.append(heading, timestamp(item.as_of), element('p', 'research-excerpt', text(item.thesis).slice(0, 140) || '未记录判断摘要'));
                 button.addEventListener('click', () => {
-                    target.querySelectorAll('button').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
-                    loadJudgmentDetail(item.id);
+                    selectedId = item.id;
+                    target.querySelectorAll('.research-judgment-button').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+                    loadJudgmentDetail(item.id, true);
                 });
-                target.append(button);
-            });
+                return button;
+            }, `本次加载最近 ${items.length} 条判断（最多 30 条，非全部历史）· 点击摘要看全文`);
         } catch (error) { if (seq === sequences.judgments) failure(target, error); }
         finally { if (seq === sequences.judgments) busy(target, false); }
     }
-    async function loadJudgmentDetail(id) {
+    async function loadJudgmentDetail(id, reveal = false) {
         const target = byId('research-judgment-detail');
         const seq = ++sequences.detail;
         busy(target, true);
@@ -190,11 +232,13 @@
                 element('h2', '', `${text(item.stock_name) || '未命名股票'} ${text(item.stock_code)}`),
                 element('span', 'research-badge', `${label(item.status)} · ${label(item.horizon)}`), timestamp(item.as_of));
             if (item.history_incomplete) limitations(target, ['历史证据不完整：不能认定这些资料在原判断时间均已可获得。']);
-            target.append(element('p', 'research-answer-text', item.thesis || '未记录判断正文'), element('h3', 'research-subheading', '依据与来源'));
-            sources(target, item.evidence);
-            target.append(element('h3', 'research-subheading', '后续复核（不回写原判断）'));
+            target.append(element('p', 'research-answer-text', item.thesis || '未记录判断正文'));
+            const evidence = fold(`依据与来源 · ${list(item.evidence).length} 条`);
+            sources(evidence, item.evidence);
+            target.append(evidence);
             const reviews = list(data.reviews);
-            if (!reviews.length) target.append(element('p', 'research-muted', '暂无复核记录，尚不能评判判断是否正确。'));
+            const reviewPanel = fold(`后续复核 · ${reviews.length} 条（不回写原判断）`);
+            if (!reviews.length) reviewPanel.append(element('p', 'research-muted', '暂无复核记录，尚不能评判判断是否正确。'));
             reviews.forEach(review => {
                 const record = element('article', 'research-record');
                 record.append(element('span', 'research-badge', label(review.status || review.verdict)),
@@ -211,10 +255,20 @@
                 record.append(dimensions);
                 limitations(record, review.limitations);
                 if (list(review.evidence).length) sources(record, review.evidence);
-                target.append(record);
+                reviewPanel.append(record);
             });
+            target.append(reviewPanel);
         } catch (error) { if (seq === sequences.detail) failure(target, error); }
-        finally { if (seq === sequences.detail) busy(target, false); }
+        finally {
+            if (seq === sequences.detail) {
+                busy(target, false);
+                target.scrollTop = 0;
+                if (reveal && window.matchMedia('(max-width: 768px)').matches) {
+                    target.scrollIntoView({block:'start', behavior:'instant'});
+                    target.focus({preventScroll:true});
+                }
+            }
+        }
     }
     async function loadExperiments() {
         const seq = ++sequences.experiments;
@@ -232,13 +286,32 @@
                         kind === 'lesson' ? '先积累可追溯的判断与复核，再形成可检验的经验。' : '未登记实验不等于策略无效，也不代表已经通过验证。');
                     return;
                 }
-                target.replaceChildren();
-                items.forEach(item => {
-                    const record = element('article', 'research-record');
-                    record.append(element('h3', '', item.title || item.name || '未命名记录'), element('span', 'research-badge', label(item.status)));
-                    if (kind === 'lesson') {
-                        record.append(timestamp(item.known_at), element('p', '', item.summary || '未提供经验说明'));
-                    } else {
+                if (kind === 'lesson') {
+                    const groups = new Map();
+                    items.forEach(item => {
+                        const key = JSON.stringify([item.title || '未命名记录', item.status || '']);
+                        if (!groups.has(key)) groups.set(key, []);
+                        groups.get(key).push(item);
+                    });
+                    target.replaceChildren(element('p', 'research-list-scope', `当前加载 ${items.length} 条经验，按主题与状态归为 ${groups.size} 组（最多加载最近 100 条）。展开看原始记录，不合并或删除数据。`));
+                    groups.forEach(records => {
+                        const first = records[0];
+                        const group = fold(first.title || '未命名记录', 'research-lesson-group');
+                        group.firstChild.append(element('span', 'research-badge', label(first.status)), element('span', 'research-group-count', `${records.length} 条`));
+                        const body = element('div');
+                        paged(body, records, 5, item => {
+                            const record = element('article', 'research-record');
+                            record.append(timestamp(item.known_at), element('p', '', item.summary || '未提供经验说明'));
+                            limitations(record, item.limitations);
+                            return record;
+                        }, '原始记录 · 每页 5 条');
+                        group.append(body);
+                        target.append(group);
+                    });
+                } else {
+                    paged(target, items, 5, item => {
+                        const record = fold(item.title || item.name || '未命名记录', 'research-experiment');
+                        record.firstChild.append(element('span', 'research-badge', label(item.status)));
                         if (item.as_of || item.created_at) record.append(timestamp(item.as_of || item.created_at));
                         const metrics = item.metrics && typeof item.metrics === 'object' ? Object.entries(item.metrics) : [];
                         if (!metrics.length) record.append(element('p', 'research-muted', '暂无已验证指标；不推算收益或成功率。'));
@@ -247,10 +320,10 @@
                             metrics.forEach(([key, value]) => dl.append(element('dt', '', key), element('dd', '', value === null ? '未提供' : value)));
                             record.append(dl);
                         }
-                    }
-                    limitations(record, item.limitations);
-                    target.append(record);
-                });
+                        limitations(record, item.limitations);
+                        return record;
+                    }, `本次加载 ${items.length} 条实验（最多最近 100 条）· 展开查看指标`);
+                }
             } catch (error) { if (seq === sequences.experiments) failure(target, error); }
             finally { if (seq === sequences.experiments) busy(target, false); }
         }));

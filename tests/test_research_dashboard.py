@@ -129,3 +129,18 @@ def test_judgment_evidence_keeps_supporting_and_counter_stances_visible():
     assert "item.stance" in js
     assert "支持证据" in js
     assert "反面证据" in js
+
+
+def test_research_guidance_is_collapsed_and_facts_are_named_honestly():
+    html = (DASHBOARD / "index.html").read_text()
+    elements = Elements(html).elements
+    guide = [a for tag, a in elements if tag == "details" and "research-guide" in a.get("class", "").split()]
+    assert len(guide) == 1
+    assert "open" not in guide[0]
+    assert "固定摘要" in html
+    assert "不按问题智能检索" in html
+
+
+def test_research_replay_detail_precedes_list_for_mobile_access():
+    html = (DASHBOARD / "index.html").read_text()
+    assert html.index('id="research-judgment-detail"') < html.index('id="research-judgments"')

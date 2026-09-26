@@ -402,12 +402,11 @@
                         <div id="research-overview" class="research-overview" aria-live="polite"><p class="research-state">加载中…</p></div>
                         <div class="research-layout">
                             <div class="card research-compose">
-                                <div class="research-eyebrow">从一个具体问题开始</div>
-                                <h2>让每次判断都有依据</h2>
-                                <p class="research-muted">查询已有记录、追问判断理由，或按需查看不同研究视角。缺少证据时明确说明，不补造历史。</p>
+                                <h2>查询已有研究记录</h2>
+                                <p class="research-muted">默认提供固定摘要；需要针对问题的分析时选择“专家按需”。两种模式均不获取实时行情。</p>
                                 <form id="research-form">
                                     <label class="research-label" for="research-question">你的问题</label>
-                                    <textarea id="research-question" rows="4" maxlength="1200" required placeholder="例如：当前账户的主要风险是什么？哪些推荐还没有足够证据？"></textarea>
+                                    <textarea id="research-question" rows="3" maxlength="1200" required placeholder="例如：当前账户的主要风险是什么？哪些推荐还没有足够证据？"></textarea>
                                     <div class="research-suggestions" aria-label="示例问题">
                                         <button type="button" data-research-question="当前账户的主要风险和数据缺口是什么？">账户与数据风险</button>
                                         <button type="button" data-research-question="最近的股票判断依据是什么？有哪些反面证据？">判断与反面证据</button>
@@ -416,17 +415,17 @@
                                     <label class="research-label" for="research-stock-code">股票代码 <span class="research-muted">（可选，6 位数字）</span></label>
                                     <input id="research-stock-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="例如 600036" autocomplete="off">
                                     <fieldset class="research-modes"><legend>回答方式</legend>
-                                        <label><input type="radio" name="research-mode" value="facts" checked><span><strong>事实查询</strong><small>本地记录汇总，不调用大模型</small></span></label>
-                                        <label><input type="radio" name="research-mode" value="experts"><span><strong>专家按需</strong><small>有限轮次的多角度研究，可能产生模型费用</small></span></label>
+                                        <label><input type="radio" name="research-mode" value="facts" checked><span><strong>事实查询 · 固定摘要</strong><small>按股票代码汇总，不调用大模型，不按问题智能检索</small></span></label>
+                                        <label><input type="radio" name="research-mode" value="experts"><span><strong>专家按需</strong><small>同一配置模型的三个视角，最多 3 次调用，可能产生费用</small></span></label>
                                     </fieldset>
                                     <div class="research-submit-row"><button class="btn btn-primary" type="submit" id="research-submit">查询资料</button><span class="research-muted">提交时临时校验操作密钥，不会保存。</span></div>
                                     <p id="research-chat-status" class="research-state" role="status" aria-live="polite"></p>
                                 </form>
                             </div>
-                            <aside class="card research-guide" aria-labelledby="research-guide-title">
-                                <div class="research-eyebrow">研究边界</div><h2 id="research-guide-title">知道什么，也要知道不知道什么</h2>
+                            <details class="card research-guide">
+                                <summary id="research-guide-title">使用说明与研究边界 <span class="research-muted">点击展开</span></summary>
                                 <ol><li><strong>核对资料时间</strong><p>资料截止时间不等于当前价格，旧判断不能直接当成今天的交易信号。</p></li><li><strong>区分事实与观点</strong><p>结论需能回到来源；反对意见与证据缺口也应保留。</p></li><li><strong>独立检验后再决策</strong><p>经验先作为假设，经过样本外验证与人工审核后，才讨论是否改策略。</p></li></ol>
-                            </aside>
+                            </details>
                         </div>
                         <div id="research-answer" aria-live="polite"></div>
                     </section>
@@ -434,8 +433,8 @@
                     <section class="dashboard-view" data-view-panel="judgments" aria-labelledby="page-title-judgments" hidden>
                         <div class="page-heading"><div><h1 id="page-title-judgments" tabindex="-1">判断回放</h1><p>回到当时的判断和证据；后来发生的事情，单独记录为复核。</p></div></div>
                         <div class="research-notice">历史缺失会明确标记。事后导入的资料不能证明当时已经知道；本页不是回测收益报告。</div>
-                        <form id="judgment-filter" class="card research-filter"><label for="judgment-code">按股票代码筛选</label><input id="judgment-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="全部股票" autocomplete="off"><button class="btn btn-primary btn-sm" type="submit">查询记录</button><span class="research-muted">最近 30 条判断</span></form>
-                        <div class="research-replay-layout"><div id="research-judgments" aria-live="polite"><p class="research-state">加载中…</p></div><div id="research-judgment-detail" class="card research-detail" aria-live="polite"><div class="research-empty"><h2>选择一条判断</h2><p>查看原始观点、证据和后续复核。没有复核记录时，不自动判定对错。</p></div></div></div>
+                        <form id="judgment-filter" class="card research-filter"><label for="judgment-code">按股票代码筛选</label><input id="judgment-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="全部股票" autocomplete="off"><button class="btn btn-primary btn-sm" type="submit">查询记录</button><span class="research-muted">加载最近 30 条 · 每页 6 条；筛选可查看某只股票的较早记录</span></form>
+                        <div class="research-replay-layout"><div id="research-judgment-detail" class="card research-detail" tabindex="-1" aria-live="polite"><div class="research-empty"><h2>选择一条判断</h2><p>点击摘要查看完整判断；证据和复核按需展开。</p></div></div><div id="research-judgments" aria-live="polite"><p class="research-state">加载中…</p></div></div>
                     </section>
 
                     <section class="dashboard-view" data-view-panel="experiments" aria-labelledby="page-title-experiments" hidden>
