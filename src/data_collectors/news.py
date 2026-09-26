@@ -2,7 +2,9 @@
 """新闻采集模块"""
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 from typing import Dict, List, Optional
 
 try:
@@ -10,6 +12,36 @@ try:
     TAVILY_AVAILABLE = True
 except ImportError:
     TAVILY_AVAILABLE = False
+
+
+def normalize_news_item(item: Dict, now: datetime | None = None) -> Dict:
+    """保留真实发布时间；搜索命中/抓取时间不是事件发生时间。"""
+    now = now or datetime.now(timezone.utc)
+    raw = item.get("published_date") or item.get("published_at")
+    published = None
+    if isinstance(raw, str):
+        try:
+            published = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                published = parsedate_to_datetime(raw)
+            except (ValueError, TypeError, OverflowError):
+                pass
+    if published and published.tzinfo is None:
+        from zoneinfo import ZoneInfo
+        published = published.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    age = now - published if published else None
+    status = ("unknown_publication" if age is None else "future_publication" if age < timedelta(0)
+              else "stale" if age > timedelta(days=7) else "recent")
+    return {
+        "title": str(item.get("title", ""))[:500], "url": str(item.get("url", ""))[:2000],
+        "source": urlparse(str(item.get("url", ""))).hostname or "",
+        "published_at": published.isoformat() if published else None,
+        "publication_precision": "date" if isinstance(raw, str) and len(raw) == 10 else "timestamp_or_unknown",
+        "fetched_at": now.isoformat(), "available_at": now.isoformat(),
+        "summary": str(item.get("content", ""))[:200], "temporal_status": status,
+        "event_eligible": status == "recent", "data_quality": "source_claimed_publication" if published else "unknown_publication",
+    }
 
 
 def search_news(query: str, max_results: int = 5, allow_sample: bool = False) -> List[Dict]:
@@ -42,20 +74,11 @@ def search_news(query: str, max_results: int = 5, allow_sample: bool = False) ->
             search_depth="basic",
         )
         
-        news_list = []
-        for item in response.get("results", []):
-            news_list.append({
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "source": item.get("url", "").split("/")[2] if item.get("url") else "",
-                "published_at": datetime.now().isoformat(),
-                "summary": item.get("content", "")[:200],
-                "fetched_at": datetime.now().isoformat(),
-            })
+        news_list = [normalize_news_item(item) for item in response.get("results", []) if isinstance(item, dict)]
         
         return news_list
-    except Exception as e:
-        return [{"error": str(e)}]
+    except Exception:
+        return [{"error": "新闻源请求失败", "data_quality": "error"}]
 
 
 def get_stock_news(stock_code: str, stock_name: str) -> List[Dict]:

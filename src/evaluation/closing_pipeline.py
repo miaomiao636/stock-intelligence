@@ -33,7 +33,8 @@ def _build_account_summary() -> Dict:
         ),
         "total_return": float(metrics.get("net_return_after_costs") or 0),
         "total_return_pct": float(metrics.get("net_return_after_costs_pct") or 0),
-        "realized_pnl": float(account.get("realized_pnl") or 0),
+        "realized_pnl": account.get("realized_pnl"),
+        "accounting_status": account.get("accounting_status", "unknown"),
         "unrealized_pnl": float(account.get("unrealized_pnl") or 0),
         "max_drawdown_pct": float(metrics.get("max_drawdown_pct") or 0),
         "position_count": len(positions),
@@ -226,6 +227,8 @@ def run_closing_pipeline(
             closing_report["market_data"] = market_data
             closing_report["account_summary"] = account_summary
             closing_report["warnings"] = list(warnings)
+            closing_report["source_status"] = dict(source_status)
+            closing_report["errors"] = list(errors)
             closing_report["created_at"] = datetime.now().isoformat()
             save_report(closing_report, "closing")
             source_status["closing_report"] = "ok"

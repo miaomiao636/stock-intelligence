@@ -772,8 +772,9 @@ def performance(date_str):
     click.echo(f"  最大回撤: {result.get('max_drawdown_pct', 0):.2f}%")
     click.echo(f"  费用+滑点: {result.get('total_transaction_costs', 0):,.2f}")
     click.echo(f"  未实现盈亏: {account_data.get('unrealized_pnl', 0):,.2f}")
-    click.echo(f"  已实现盈亏: {account_data.get('realized_pnl', 0):,.2f}")
-    click.echo(f"  已平仓胜率: {result.get('trade_win_rate_pct', 0):.1f}%")
+    realized, win_rate = account_data.get("realized_pnl"), result.get("trade_win_rate_pct")
+    click.echo("  已实现盈亏: " + (f"{realized:,.2f}" if isinstance(realized, (int, float)) else "未能核实"))
+    click.echo("  已平仓胜率: " + (f"{win_rate:.1f}%" if isinstance(win_rate, (int, float)) else "暂无可核实样本"))
     click.echo(f"  持仓数量: {len(positions)}")
 
 
@@ -1128,6 +1129,98 @@ def sources():
     
     if has_error:
         sys.exit(1)
+
+
+@cli.group()
+def research():
+    """只读研究与复盘归档；绝不触发交易、联网补价或自动调整策略。"""
+
+
+def _research_store():
+    from src.research.store import ResearchStore
+    return ResearchStore(PROJECT_ROOT / "data" / "stock_intelligence.db")
+
+
+def _research_json(path):
+    path = Path(path)
+    if path.stat().st_size > 5_000_000:
+        raise ValueError("研究输入超过 5 MB，请拆分")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("研究输入必须为 JSON 对象")
+    return value
+
+
+@research.command("status")
+def research_status():
+    click.echo(json.dumps(_research_store().get_summary(), ensure_ascii=False, indent=2))
+
+
+@research.command("import-history")
+def research_import_history():
+    """幂等归档现存盘前/盘中报告，缺失的当时证据保持未知。"""
+    store = _research_store()
+    imported = skipped = failed = 0
+    base = PROJECT_ROOT / "data" / "recommendations"
+    for path in sorted(base.glob("*/*.json")):
+        if path.stem not in {"morning", "afternoon"}:
+            continue
+        try:
+            result = store.import_report(_research_json(path), source_id=f"{path.parent.name}:{path.stem}")
+            imported += bool(result["imported"])
+            skipped += not result["imported"]
+        except (ValueError, OSError, KeyError):
+            failed += 1
+            click.echo(f"未导入：{path.parent.name}/{path.name}（结构、日期或证据异常）", err=True)
+    click.echo(json.dumps({"imported_reports": imported, "already_imported": skipped, "failed": failed}, ensure_ascii=False))
+    if failed:
+        raise click.ClickException("部分报告未通过证据校验，未猜测或覆盖原始数据")
+
+
+@research.command("review-history")
+def research_review_history():
+    """只用已有收盘评估追加复盘，不拉取现在行情冒充历史数据。"""
+    store = _research_store()
+    processed = failed = 0
+    for path in sorted((PROJECT_ROOT / "data" / "recommendations").glob("*/closing.json")):
+        try:
+            report = _research_json(path)
+            evaluation = report.get("evaluation")
+            if isinstance(evaluation, dict) and evaluation.get("stock_results"):
+                store.review_from_evaluation(evaluation, source_id=f"{path.parent.name}:closing")
+                store.generate_candidate_lessons(source_id=f"{path.parent.name}:closing")
+                processed += 1
+        except (ValueError, OSError, KeyError):
+            failed += 1
+    click.echo(json.dumps({"processed_reports": processed, "failed": failed}, ensure_ascii=False))
+    if failed:
+        raise click.ClickException("部分复盘未通过校验，原判断未改写")
+
+
+@research.command("experiment")
+@click.argument("input_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def research_experiment(input_file):
+    """执行显式PIT样本诊断，数据缺失记为blocked，不训练或上线模型。"""
+    result = _research_store().create_experiment(_research_json(input_file))
+    click.echo(json.dumps({key: result.get(key) for key in ("id", "status", "metrics", "limitations", "auto_promoted")}, ensure_ascii=False, indent=2))
+
+
+@research.command("add-lesson")
+@click.argument("input_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def research_add_lesson(input_file):
+    """登记有证据/反例引用的候选经验，不影响交易。"""
+    result = _research_store().create_lesson(_research_json(input_file))
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@research.command("review-lesson")
+@click.argument("lesson_id")
+@click.option("--status", required=True, type=click.Choice(["validated", "rejected", "retired"]))
+@click.option("--reason", required=True)
+@click.option("--confirm", is_flag=True, help="明确确认人工审核，仍不自动影响策略")
+def research_review_lesson(lesson_id, status, reason, confirm):
+    result = _research_store().transition_lesson(lesson_id, status, actor="operator_cli", reason=reason, confirmed=confirm)
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

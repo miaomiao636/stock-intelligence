@@ -13,8 +13,34 @@ from typing import Dict, Optional
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 
-def save_report(report: Dict, report_type: str = "morning") -> Path:
+def save_report(report: Dict, report_type: str = "morning", *, archive_research: bool = True) -> Path:
     """保存报告到JSON文件和SQLite"""
+    source_report = report
+    report = dict(report)
+    if archive_research:
+        report.pop("research_archive", None)
+    if archive_research and report_type in {"morning", "afternoon"} and report.get("stock_recommendations"):
+        try:
+            from src.research.store import ResearchStore
+            archive = ResearchStore(DATA_DIR / "stock_intelligence.db").import_report(
+                report, source_id=f"{report.get('date')}:{report_type}")
+            report["research_archive"] = {"status": "ok", "import_id": archive["import_id"],
+                                          "history_incomplete": archive["history_incomplete"]}
+        except Exception:
+            # Keep the operational report even when archive fails; expose the failure, never fabricate success.
+            report["research_archive"] = {"status": "error", "reason": "研究归档失败，需检查服务日志/运行数据"}
+    if archive_research and report_type == "closing" and report.get("evaluation", {}).get("stock_results"):
+        try:
+            from src.research.store import ResearchStore
+            store = ResearchStore(DATA_DIR / "stock_intelligence.db")
+            review = store.review_from_evaluation(
+                report["evaluation"], source_id=f"{report.get('date')}:closing")
+            lessons = store.generate_candidate_lessons(source_id=f"{report.get('date')}:closing")
+            report["research_archive"] = {"status": "ok", "review": review, "lessons": lessons}
+        except Exception:
+            report["research_archive"] = {"status": "error", "reason": "判断复盘归档失败，旧判断保持不变"}
+    if "research_archive" in report:
+        source_report["research_archive"] = report["research_archive"]
     date_str = report.get("date", datetime.now().strftime("%Y-%m-%d"))
     report_dir = DATA_DIR / "recommendations" / date_str
     report_dir.mkdir(parents=True, exist_ok=True)

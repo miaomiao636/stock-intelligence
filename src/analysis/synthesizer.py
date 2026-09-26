@@ -394,6 +394,7 @@ class Synthesizer:
     
     def _format_news_summary(self, news_list: List[Dict]) -> str:
         """格式化新闻摘要"""
+        news_list = [item for item in news_list if item.get("event_eligible") is True and "error" not in item]
         
         if not news_list:
             return "暂无新闻"
@@ -403,7 +404,7 @@ class Synthesizer:
             title = news.get("title", "")
             source = news.get("source", "")
             summary = news.get("summary", "")[:100]
-            lines.append(f"{i}. {title} ({source})")
+            lines.append(f"{i}. {title} ({source}; 发布: {news.get('published_at')}; 抓取: {news.get('fetched_at')})")
             if summary:
                 lines.append(f"   摘要: {summary}")
         
@@ -467,7 +468,7 @@ class Synthesizer:
             missing.append("realtime_prices")
 
         # 检查新闻数据
-        if news_list and len(news_list) > 0 and news_list[0].get("title") != "暂无新闻":
+        if any(item.get("event_eligible") is True and "error" not in item for item in news_list):
             available.append("news")
         else:
             missing.append("news")

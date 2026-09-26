@@ -3,7 +3,7 @@
 
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Literal
 from zoneinfo import ZoneInfo
 
 import os
@@ -13,10 +13,10 @@ import threading
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.models import ApiResponse
 
@@ -661,6 +661,11 @@ def get_tracking(date_str: Optional[str] = None):
 
     if not data:
         return {**ApiResponse.fail("No tracking data found"), "tracks": [], "summary": {}}
+    from src.research.health import tracking_freshness
+    data = dict(data)
+    data["freshness"] = tracking_freshness(data)
+    data["summary"] = dict(data.get("summary") or {})
+    data["summary"].setdefault("execution_coverage_pct", None)
     return data
 
 
@@ -687,7 +692,11 @@ def get_tracking_suggestions():
 def get_auto_trades(limit: int = 30):
     """Get auto-trade logs"""
     from src.paper_trading.trading_service import TradingService
-    return TradingService().ledger.list_trades(limit=limit)
+    # Preserve the legacy field for audit; display accounting-correct both-side costs.
+    limit = max(1, min(limit, 1000))
+    rows = TradingService().get_trade_accounting()["trades"]
+    return [{**row, "legacy_realized_pnl": row.get("realized_pnl"),
+             "realized_pnl": row.get("net_realized_pnl")} for row in reversed(rows[-limit:])]
 
 
 # API: 自动操盘单日日志
@@ -695,7 +704,10 @@ def get_auto_trades(limit: int = 30):
 def get_auto_trade_log(date_str: str):
     """Get auto-trade log for a specific date"""
     from src.paper_trading.trading_service import TradingService
-    log = TradingService().ledger.list_trades(trade_date=date_str)
+    date.fromisoformat(date_str)
+    rows = TradingService().get_trade_accounting()["trades"]
+    log = [{**row, "legacy_realized_pnl": row.get("realized_pnl"),
+            "realized_pnl": row.get("net_realized_pnl")} for row in rows if row.get("trade_date") == date_str]
     if not log:
         return ApiResponse.fail(f"No trade log for {date_str}")
     return log
@@ -1018,6 +1030,116 @@ def get_asset_analysis():
         "weekly": aggregate(lambda d: f"{datetime.fromisoformat(d).isocalendar()[0]}-W{datetime.fromisoformat(d).isocalendar()[1]:02d}"),
         "monthly": aggregate(lambda d: d[:7]),
     }
+
+
+class ResearchQuestion(BaseModel):
+    question: str = Field(min_length=1, max_length=1200)
+    stock_code: Optional[str] = Field(default=None, pattern=r"^\d{6}$")
+    mode: Literal["facts", "experts"] = "facts"
+    request_id: str = Field(default="", max_length=80)
+
+
+def research_store():
+    from src.research.store import ResearchStore
+    return ResearchStore(DATA_DIR / "stock_intelligence.db")
+
+
+def research_entry_plans():
+    from src.paper_trading.entry_plans import EntryPlanStore
+    from src.storage.trading_ledger import TradingLedger
+    store = EntryPlanStore(TradingLedger(DATA_DIR))
+    return store.get_summary(date.today().isoformat())
+
+
+@app.get("/api/research/overview")
+def research_overview():
+    store = research_store()
+    summary = store.get_summary()
+    latest = store.list_judgments(limit=1)
+    summary["data_as_of"] = latest[0]["as_of"] if latest else None
+    return {"available": True, **summary, "entry_plans": research_entry_plans(),
+            "limitations": ["只读研究，不是收益承诺", "旧报告缺失的原始证据不会自动补造", "实验结果需样本外和前向影子验证"]}
+
+
+@app.get("/api/research/judgments")
+def research_judgments(code: Optional[str] = Query(default=None, pattern=r"^\d{6}$"),
+                       limit: int = Query(default=30, ge=1, le=100)):
+    return {"items": research_store().list_judgments(stock_code=code, limit=limit)}
+
+
+@app.get("/api/research/judgments/{judgment_id}")
+def research_judgment(judgment_id: str):
+    store = research_store()
+    judgment = store.get_judgment(judgment_id)
+    if judgment is None:
+        raise HTTPException(404, "判断记录不存在")
+    evidence = []
+    for stance, key in (("supporting", "supporting_evidence"), ("counter", "counter_evidence")):
+        for ref in judgment.get(key) or []:
+            evidence_id = ref.get("evidence_id") if isinstance(ref, dict) else ref
+            row = store.get_evidence(evidence_id)
+            if row:
+                evidence.append({**row, "stance": stance})
+    judgment["evidence"] = evidence
+    return {"judgment": judgment, "reviews": store.list_reviews(judgment_id=judgment_id)}
+
+
+@app.get("/api/research/lessons")
+def research_lessons():
+    return {"items": research_store().list_lessons(limit=100)}
+
+
+@app.get("/api/research/experiments")
+def research_experiments():
+    return {"items": research_store().list_experiments(limit=100)}
+
+
+@app.get("/api/research/entry-plans")
+def research_plans(trade_date: Optional[str] = None):
+    from src.paper_trading.entry_plans import EntryPlanStore
+    from src.storage.trading_ledger import TradingLedger
+    if trade_date:
+        date.fromisoformat(trade_date)
+    store = EntryPlanStore(TradingLedger(DATA_DIR))
+    target = trade_date or date.today().isoformat()
+    return {"items": store.list_plans(trade_date=target), "summary": store.get_summary(target)}
+
+
+@app.post("/api/research/chat")
+def research_chat(body: ResearchQuestion):
+    from src.research.assistant import ResearchAssistant, RequestBudget, BudgetExceeded
+    from datetime import timezone
+    store = research_store()
+    now = datetime.now(timezone.utc).isoformat()
+    judgments = store.list_judgments(stock_code=body.stock_code, as_of=now, limit=6)
+    evidence, seen = [], set()
+    for row in judgments:
+        for ref in (row.get("supporting_evidence") or []) + (row.get("counter_evidence") or []):
+            evidence_id = ref.get("evidence_id") if isinstance(ref, dict) else ref
+            if evidence_id in seen or len(evidence) >= 5:
+                continue
+            seen.add(evidence_id)
+            item = store.get_evidence(evidence_id, as_of=now)
+            if item:
+                evidence.append(item)
+    from src.paper_trading.trading_service import TradingService
+    accounting = TradingService(DATA_DIR).get_trade_accounting()["summary"]
+    context = {
+        "stock_code": body.stock_code,
+        "as_of": max((str(row.get("as_of") or "") for row in judgments), default=None),
+        "judgments": [{k: row.get(k) for k in ("id", "stock_code", "stock_name", "as_of", "thesis", "horizon", "history_incomplete")} for row in judgments],
+        "lessons": store.list_lessons(as_of=now, limit=5),
+        "evidence": evidence,
+        "accounting": accounting,
+        "entry_plans": research_entry_plans(),
+        "sources": [{"label": f"判断 {row.get('id')} · {row.get('as_of')}"} for row in judgments],
+        "limitations": ["只读取本系统已保存资料，不查询互联网；报价请查看行情页的取价时间。"],
+    }
+    assistant = ResearchAssistant(RequestBudget(DATA_DIR / "stock_intelligence.db"))
+    try:
+        return assistant.answer(body.question, context, body.mode, body.request_id)
+    except BudgetExceeded as exc:
+        raise HTTPException(429, str(exc)) from None
 
 
 # 挂载静态文件

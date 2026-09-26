@@ -324,3 +324,10 @@ def test_ubuntu_cron_serializes_report_and_watchdog_with_shared_locks():
     assert "/usr/bin/flock -n" in cron_installer
     assert "/usr/bin/flock -w 1800" in cron_installer
     assert "deploy/install_cron_ubuntu.sh" in update_script
+# Missing accounting evidence must remain unknown, not an invented zero.
+def test_closing_report_keeps_missing_realized_pnl_unknown():
+    from src.reporting.formatter import format_closing_report
+    output = format_closing_report("2026-09-24", {}, {}, account_summary={
+        "status": "ok", "cash": 100, "total_equity": 100, "realized_pnl": None,
+        "unrealized_pnl": 0, "accounting_status": "incomplete"})
+    assert "已实现盈亏: 未能核实" in output

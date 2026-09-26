@@ -22,6 +22,16 @@ from src.reporting.report_store import save_report, save_run_artifact, load_repo
 from src.analysis.synthesizer import Synthesizer
 
 
+def persist_morning_outcome(report, run_id, source_status, errors):
+    """Persist final component health after tracking, without overwriting a preserved good report."""
+    if not source_status.get("report_preserved"):
+        report["source_status"] = dict(source_status)
+        report["errors"] = list(errors)
+        save_report(report, "morning", archive_research=False)
+    save_run_artifact(run_id=run_id, input_snapshot={"date": report.get("date"), "mode": "morning"},
+                      source_status=source_status, report=report, errors=errors)
+
+
 def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: str = None) -> Dict:
     """执行盘前流程"""
     
@@ -263,18 +273,9 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
                 print(f"  ℹ️  保留已有数据({existing_stocks}只)不覆盖fallback({new_stocks}只)")
                 source_status["report_preserved"] = "existing_llm_success" if existing_llm == "success" else "richer_existing_report"
                 report = existing_report
-            else:
-                report_file = save_report(report, "morning")
-        else:
-            report_file = save_report(report, "morning")
-
-        run_dir = save_run_artifact(
-            run_id=run_id,
-            input_snapshot={"date": today, "mode": "morning"},
-            source_status=source_status,
-            report=report,
-            errors=errors,
-        )
+        if not source_status.get("report_preserved"):
+            # Today's recommendation must be visible to the tracker before it runs.
+            save_report(report, "morning")
 
     # 9. 08:45流程只生成盘前报告，绝不成交。
     # 最终订单必须由09:35任务重新取价、发送飞书卡片，再于确认后或09:40条件执行。
@@ -299,6 +300,9 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
             source_status["tracking"] = "degraded"
             errors.append(f"推荐跟踪失败: {e}")
             print(f"  ⚠️  推荐跟踪失败: {e}")
+
+    if not dry_run:
+        persist_morning_outcome(report, run_id, source_status, errors)
 
     # A4: 根据 errors 正确判定最终状态（之前恒返回 success）
     has_errors = len(errors) > 0

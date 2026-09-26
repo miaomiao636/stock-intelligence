@@ -206,7 +206,8 @@ def format_closing_report(
         total_equity = float(account_summary.get("total_equity") or 0)
         total_return = float(account_summary.get("total_return") or 0)
         total_return_pct = float(account_summary.get("total_return_pct") or 0)
-        realized_pnl = float(account_summary.get("realized_pnl") or 0)
+        realized_pnl = account_summary.get("realized_pnl")
+        realized_text = f"{realized_pnl:+,.2f}元" if isinstance(realized_pnl, (int, float)) else "未能核实（缺少完整成交证据）"
         unrealized_pnl = float(account_summary.get("unrealized_pnl") or 0)
         transaction_costs = float(account_summary.get("total_transaction_costs") or 0)
         return_sign = "+" if total_return >= 0 else "-"
@@ -218,7 +219,7 @@ def format_closing_report(
                 "  现金流及交易成本调整后总收益: "
                 f"{return_sign}¥{abs(total_return):,.2f} ({total_return_pct:+.2f}%)"
             ),
-            f"  已实现盈亏: {realized_pnl:+,.2f}元｜未实现盈亏: {unrealized_pnl:+,.2f}元",
+            f"  已实现盈亏: {realized_text}｜未实现盈亏: {unrealized_pnl:+,.2f}元",
             (
                 f"  当前持仓: {int(account_summary.get('position_count') or 0)}只｜"
                 f"最大回撤: {float(account_summary.get('max_drawdown_pct') or 0):.2f}%｜"
@@ -296,13 +297,34 @@ def format_json_report(
 ) -> Dict:
     """格式化JSON报告"""
     
+    import hashlib
+    import os
+    from pathlib import Path
+    from datetime import timezone
+    from src.analysis.prompts import MORNING_ANALYSIS_PROMPT, AFTERNOON_ANALYSIS_PROMPT
+    root = Path(__file__).resolve().parents[2]
+    strategy_file = root / "config" / "strategy.yaml"
+    strategy_version = "sha256:" + hashlib.sha256(strategy_file.read_bytes()).hexdigest()
+    observed_at = datetime.now(timezone.utc).isoformat()
+    snapshots = [{"source": "market_collector", "kind": "market_snapshot",
+                  "available_at": observed_at, "fetched_at": observed_at,
+                  "published_at": None, "snapshot": market_data,
+                  "history_incomplete": bool(market_data.get("error")) or not bool(market_data.get("realtime_stock_prices"))}]
+    snapshots.extend({"source": item.get("url") or item.get("source") or "unknown",
+                      "kind": "news", "published_at": item.get("published_at"),
+                      "available_at": item.get("available_at"), "fetched_at": item.get("fetched_at"),
+                      "snapshot": item} for item in news_list if "error" not in item)
     return {
         "date": date_str,
         "type": report_type,
         "run_id": f"{date_str}-{report_type}",
-        "created_at": datetime.now().isoformat(),
-        "data_as_of": datetime.now().isoformat(),
-        "strategy_version": "1.0",
+        "created_at": observed_at,
+        "data_as_of": observed_at,
+        "strategy_version": strategy_version,
+        "model_version": os.getenv("LLM_MODEL", "mimo-v2.5-pro"),
+        "prompt_version": "sha256:" + hashlib.sha256((AFTERNOON_ANALYSIS_PROMPT if report_type == "afternoon" else MORNING_ANALYSIS_PROMPT).encode()).hexdigest(),
+        "data_version": "evidence-snapshot-v1",
+        "evidence_snapshots": snapshots,
         "market_regime": market_data.get("market_regime", "neutral"),
         "market_data": market_data,
         "sector_recommendations": sector_recommendations,
