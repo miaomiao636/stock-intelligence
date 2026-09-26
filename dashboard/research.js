@@ -1,0 +1,348 @@
+/* Research views only read evidence and request bounded research; never place orders. */
+(() => {
+    'use strict';
+    const loaded = new Set();
+    const sequences = {judgments: 0, detail: 0, experiments: 0, research: 0};
+    const byId = id => document.getElementById(id);
+    const list = value => Array.isArray(value) ? value : [];
+    function itemsFrom(data) {
+        if (!Array.isArray(data.items)) throw new Error('资料结构不完整，无法确认是否有记录。');
+        return data.items;
+    }
+    const text = value => value === null || value === undefined ? '' :
+        (typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value));
+    const element = (tag, className = '', value = '') => {
+        const el = document.createElement(tag);
+        if (className) el.className = className;
+        el.textContent = text(value);
+        return el;
+    };
+    const labels = {pending:'待验证', proposed:'待验证', candidate:'待验证', active:'跟踪中',
+        open:'跟踪中', draft:'草稿', completed:'已完成', reviewed:'已复核', rejected:'未通过',
+        validated:'已验证', archived:'已归档', blocked:'受阻', history_incomplete:'历史证据不足',
+        insufficient_data:'数据不足', short:'短期', medium:'中期', long:'长期',
+        facts:'事实查询', experts:'专家研究', bull:'支持视角', bear:'反对视角', risk:'风险审查',
+        waiting_trigger:'等待触发', waiting_price:'等待有效价格', waiting_quote:'等待有效行情', waiting_session:'等待交易时段',
+        filled:'已模拟成交', expired:'已过期', watching:'观察中', pending_trigger:'等待触发', ready:'条件就绪',
+        correct:'方向正确', incorrect:'方向错误', inconclusive:'无法判断', not_triggered:'未触发',
+        closed:'已平仓', theoretical_trigger:'理论触发（非账户成交）', unknown:'未知',
+        unavailable:'无可核验损益', realized:'已实现', unrealized:'未实现', retired:'已停用', recorded:'已归档'};
+    const label = value => labels[value] || text(value) || '未标注';
+    function state(target, message, error = false) {
+        target.replaceChildren(element('p', `research-state${error ? ' is-error' : ''}`, message));
+    }
+    function empty(target, title, description) {
+        const block = element('div', 'research-empty');
+        block.append(element('h3', '', title), element('p', '', description));
+        target.replaceChildren(block);
+    }
+    function busy(target, value) { target.setAttribute('aria-busy', String(value)); }
+    function timestamp(value) {
+        const raw = text(value);
+        // Backend timestamps without an offset are China-market local times, not browser local times.
+        const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+        const withZone = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(normalized)
+            ? normalized + '+08:00' : normalized;
+        const parsed = Date.parse(withZone);
+        const stale = Number.isFinite(parsed) && Date.now() - parsed > 48 * 60 * 60 * 1000;
+        return element('span', `research-time${stale ? ' is-stale' : ''}`,
+            `资料截止：${raw || '时间未提供'}${stale ? ' · 资料时间较早，请先核对新信息' : ''}`);
+    }
+    function limitations(parent, values) {
+        const notes = list(values).filter(Boolean);
+        if (!notes.length) return;
+        const ul = element('ul', 'research-limitations');
+        notes.forEach(note => ul.append(element('li', '', note)));
+        parent.append(ul);
+    }
+    function sources(parent, values) {
+        const items = list(values);
+        if (!items.length) {
+            parent.append(element('p', 'research-muted', '未提供可核验来源；不能仅凭回答作出交易判断。'));
+            return;
+        }
+        const ul = element('ul', 'research-sources');
+        items.forEach(source => {
+            const item = typeof source === 'object' && source !== null ? source : {label: source};
+            const li = element('li');
+            const stance = {supporting:'支持证据', counter:'反面证据'}[item.stance];
+            const title = `${stance ? stance + ' · ' : ''}${text(item.label || item.title || item.summary || item.content || item.source || '来源未命名')}`;
+            let url;
+            try { url = new URL(item.url); } catch (_) { url = null; }
+            if (url && ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password) {
+                const a = element('a', '', title);
+                a.href = url.href;
+                a.target = '_blank';
+                a.rel = 'noopener noreferrer';
+                li.append(a);
+            } else li.append(element('span', '', title));
+            if (item.known_at || item.as_of) li.append(element('span', '', `（已知时间：${text(item.known_at || item.as_of)}）`));
+            ul.append(li);
+        });
+        parent.append(ul);
+    }
+    async function request(url, options = {}, apiKey = '', timeout = 15000) {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), timeout);
+        try {
+            const response = await apiFetch(url, {...options, signal: controller.signal}, apiKey);
+            if (!response.ok) {
+                const messages = {401:'操作密钥未通过验证。', 403:'当前请求无权执行。',
+                    404:'研究接口尚未部署，请确认服务器版本。', 409:'相同研究请求正在处理或请求状态冲突，请稍后查询。',
+                    422:'输入未通过检查，请核对问题和股票代码。', 429:'研究额度或请求频率已达上限，请稍后再试。',
+                    503:'研究服务暂不可用，或操作密钥尚未配置。'};
+                throw new Error(messages[response.status] || `服务响应异常（HTTP ${response.status}）。`);
+            }
+            const data = await response.json();
+            if (!data || typeof data !== 'object' || data.error) throw new Error('未取得完整的研究数据。');
+            return data;
+        } catch (error) {
+            if (error.name === 'AbortError') throw new Error('请求超时，未获得结果。请先核对网络和服务状态，避免连续重复提交。');
+            throw error;
+        } finally { window.clearTimeout(timer); }
+    }
+    const failure = (target, error) => state(target, `加载失败：${error.message || '请检查连接后重试。'}`, true);
+    async function loadOverview() {
+        const target = byId('research-overview');
+        const seq = ++sequences.research;
+        busy(target, true);
+        state(target, '加载中：核对研究资料…');
+        try {
+            const data = await request('/api/research/overview');
+            if (seq !== sequences.research) return;
+            target.replaceChildren();
+            const grid = element('div', 'research-stat-grid');
+            [['判断记录',data.judgments_count], ['研究经验',data.lessons_count], ['验证实验',data.experiments_count]].forEach(([name, value]) => {
+                const card = element('div', 'research-stat');
+                const count = typeof value === 'number' && Number.isFinite(value) ? String(value) : '待核验';
+                card.append(element('span', '', name), element('strong', '', count));
+                grid.append(card);
+            });
+            target.append(grid, timestamp(data.data_as_of), element('span', 'research-time', `快照查询时间：${text(data.as_of) || '未提供'}（不代表行情或证据已更新）`));
+            const plans = data.entry_plans;
+            const planPanel = element('details', 'research-plan-summary');
+            planPanel.append(element('summary', '', '入场计划 · 为什么还未成交？'));
+            if (!plans || !Number.isFinite(plans.total) || plans.total === 0) {
+                planPanel.append(element('p', 'research-muted', '当前日期没有已归档的入场计划：未归档不等于没有机会，也不能据此认定未触发或未成交。'));
+            } else {
+                planPanel.append(element('p', 'research-muted', `计划日期：${text(plans.trade_date) || '未提供'} · 已归档 ${plans.total} 条计划；状态来自服务端记录。`));
+                const dl = element('dl', 'research-metrics');
+                Object.entries(plans.by_status || {}).forEach(([key, count]) => dl.append(element('dt', '', label(key)), element('dd', '', count)));
+                planPanel.append(dl, element('h3', 'research-subheading', '服务端记录的原因'));
+                const reasons = Object.entries(plans.reason_counts || {});
+                if (!reasons.length) planPanel.append(element('p', 'research-muted', '暂无已归档原因，不能自动归因于策略或市场。'));
+                else {
+                    const ul = element('ul', 'research-sources');
+                    reasons.forEach(([reason, count]) => ul.append(element('li', '', `${reason} · ${count} 条`)));
+                    planPanel.append(ul);
+                }
+            }
+            target.append(planPanel);
+            if (data.available === false) target.append(element('p', 'research-state', '暂无可用研究档案，当前不能据此判断策略是否有效。'));
+            limitations(target, data.limitations);
+        } catch (error) { if (seq === sequences.research) failure(target, error); }
+        finally { if (seq === sequences.research) busy(target, false); }
+    }
+    async function loadJudgments() {
+        const target = byId('research-judgments');
+        const detail = byId('research-judgment-detail');
+        const seq = ++sequences.judgments;
+        ++sequences.detail;
+        busy(detail, false);
+        empty(detail, '选择一条判断', '查看原始观点、证据和后续复核。没有复核记录时，不自动判定对错。');
+        busy(target, true);
+        state(target, '加载中：查询判断记录…');
+        try {
+            const code = byId('judgment-code').value.trim();
+            const data = await request(`/api/research/judgments?limit=30${code ? '&code=' + encodeURIComponent(code) : ''}`);
+            if (seq !== sequences.judgments) return;
+            const items = itemsFrom(data);
+            if (!items.length) { empty(target, '暂无判断记录', '对应股票尚未留下可回放的研究判断；不会用今天的信息补写历史。'); return; }
+            target.replaceChildren();
+            items.forEach(item => {
+                const button = element('button', 'research-judgment-button');
+                button.type = 'button';
+                button.setAttribute('aria-pressed', 'false');
+                button.append(element('strong', '', `${text(item.stock_name) || '未命名股票'} ${text(item.stock_code)}`),
+                    element('span', 'research-badge', label(item.status)), timestamp(item.as_of),
+                    element('p', 'research-excerpt', text(item.thesis).slice(0, 140) || '未记录判断摘要'));
+                if (item.history_incomplete) button.append(element('span', 'research-badge is-warning', '历史证据不足'));
+                button.addEventListener('click', () => {
+                    target.querySelectorAll('button').forEach(other => other.setAttribute('aria-pressed', String(other === button)));
+                    loadJudgmentDetail(item.id);
+                });
+                target.append(button);
+            });
+        } catch (error) { if (seq === sequences.judgments) failure(target, error); }
+        finally { if (seq === sequences.judgments) busy(target, false); }
+    }
+    async function loadJudgmentDetail(id) {
+        const target = byId('research-judgment-detail');
+        const seq = ++sequences.detail;
+        busy(target, true);
+        state(target, '加载中：读取原始判断及复核…');
+        try {
+            const data = await request(`/api/research/judgments/${encodeURIComponent(text(id))}`);
+            if (seq !== sequences.detail) return;
+            const item = data.judgment;
+            if (!item || typeof item !== 'object') throw new Error('未找到该判断的原始记录。');
+            target.replaceChildren(element('div', 'research-eyebrow', '原始判断'),
+                element('h2', '', `${text(item.stock_name) || '未命名股票'} ${text(item.stock_code)}`),
+                element('span', 'research-badge', `${label(item.status)} · ${label(item.horizon)}`), timestamp(item.as_of));
+            if (item.history_incomplete) limitations(target, ['历史证据不完整：不能认定这些资料在原判断时间均已可获得。']);
+            target.append(element('p', 'research-answer-text', item.thesis || '未记录判断正文'), element('h3', 'research-subheading', '依据与来源'));
+            sources(target, item.evidence);
+            target.append(element('h3', 'research-subheading', '后续复核（不回写原判断）'));
+            const reviews = list(data.reviews);
+            if (!reviews.length) target.append(element('p', 'research-muted', '暂无复核记录，尚不能评判判断是否正确。'));
+            reviews.forEach(review => {
+                const record = element('article', 'research-record');
+                record.append(element('span', 'research-badge', label(review.status || review.verdict)),
+                    timestamp(review.known_at || review.reviewed_at || review.as_of),
+                    element('p', '', review.summary || review.content || review.outcome || '未提供复核说明'));
+                const dimensions = element('dl', 'research-metrics');
+                [['预测方向', review.prediction_status], ['实际执行', review.execution_status],
+                    ['账户损益', review.net_pnl_status]].forEach(([name, value]) => {
+                    dimensions.append(element('dt', '', name), element('dd', '', label(value)));
+                });
+                if (typeof review.net_pnl_after_costs === 'number' && Number.isFinite(review.net_pnl_after_costs)) {
+                    dimensions.append(element('dt', '', '已记录扣费后损益'), element('dd', '', `¥${review.net_pnl_after_costs.toFixed(2)}`));
+                }
+                record.append(dimensions);
+                limitations(record, review.limitations);
+                if (list(review.evidence).length) sources(record, review.evidence);
+                target.append(record);
+            });
+        } catch (error) { if (seq === sequences.detail) failure(target, error); }
+        finally { if (seq === sequences.detail) busy(target, false); }
+    }
+    async function loadExperiments() {
+        const seq = ++sequences.experiments;
+        const panels = [['research-lessons','/api/research/lessons','lesson'], ['research-experiments','/api/research/experiments','experiment']];
+        await Promise.all(panels.map(async ([id, url, kind]) => {
+            const target = byId(id);
+            busy(target, true);
+            state(target, '加载中：读取研究记录…');
+            try {
+                const data = await request(url);
+                if (seq !== sequences.experiments) return;
+                const items = itemsFrom(data);
+                if (!items.length) {
+                    empty(target, kind === 'lesson' ? '暂无研究经验' : '暂无验证实验',
+                        kind === 'lesson' ? '先积累可追溯的判断与复核，再形成可检验的经验。' : '未登记实验不等于策略无效，也不代表已经通过验证。');
+                    return;
+                }
+                target.replaceChildren();
+                items.forEach(item => {
+                    const record = element('article', 'research-record');
+                    record.append(element('h3', '', item.title || item.name || '未命名记录'), element('span', 'research-badge', label(item.status)));
+                    if (kind === 'lesson') {
+                        record.append(timestamp(item.known_at), element('p', '', item.summary || '未提供经验说明'));
+                    } else {
+                        if (item.as_of || item.created_at) record.append(timestamp(item.as_of || item.created_at));
+                        const metrics = item.metrics && typeof item.metrics === 'object' ? Object.entries(item.metrics) : [];
+                        if (!metrics.length) record.append(element('p', 'research-muted', '暂无已验证指标；不推算收益或成功率。'));
+                        else {
+                            const dl = element('dl', 'research-metrics');
+                            metrics.forEach(([key, value]) => dl.append(element('dt', '', key), element('dd', '', value === null ? '未提供' : value)));
+                            record.append(dl);
+                        }
+                    }
+                    limitations(record, item.limitations);
+                    target.append(record);
+                });
+            } catch (error) { if (seq === sequences.experiments) failure(target, error); }
+            finally { if (seq === sequences.experiments) busy(target, false); }
+        }));
+    }
+    function renderAnswer(data, question) {
+        const target = byId('research-answer');
+        const card = element('article', 'card research-answer-card');
+        card.append(element('div', 'research-section-heading'));
+        card.firstChild.append(element('h2', '', '研究回答'), element('span', 'research-badge', label(data.mode)));
+        card.append(timestamp(data.as_of), element('p', 'research-question-echo', `问题：${question}`),
+            element('div', 'research-answer-text', data.answer || '未获得可用回答，请核对研究资料。'));
+        if (list(data.roles).length) {
+            const roles = element('div', 'research-role-grid');
+            list(data.roles).forEach(role => {
+                const item = typeof role === 'object' && role !== null ? role : {role};
+                const block = element('section', 'research-role');
+                block.append(element('h3', '', label(item.name || item.role)), element('p', '',
+                    item.analysis || item.summary || item.answer || item.content || item.conclusion || '未提供该视角的独立意见'));
+                roles.append(block);
+            });
+            card.append(roles, element('p', 'research-muted', '视角分工不等于独立样本；多个模型或角色一致，也不能替代样本外验证。'));
+        }
+        card.append(element('h3', 'research-subheading', '可追溯来源'));
+        sources(card, data.sources);
+        limitations(card, data.limitations);
+        if (data.usage && typeof data.usage === 'object') {
+            const details = element('details');
+            details.append(element('summary', 'research-muted', '本次研究用量（服务端记录）'), element('pre', 'research-answer-text', data.usage));
+            card.append(details);
+        }
+        target.replaceChildren(card);
+    }
+    async function submitQuestion(event) {
+        event.preventDefault();
+        const status = byId('research-chat-status');
+        const button = byId('research-submit');
+        if (button.disabled) return;
+        status.className = 'research-state';
+        status.textContent = '';
+        if (window.isSecureContext !== true) {
+            status.className = 'research-state is-error';
+            status.textContent = '当前页面不是安全连接。请先配置 HTTPS，再提交研究查询；为保护操作密钥，本页不会询问或发送密钥。公开研究资料仍可查看。';
+            return;
+        }
+        const question = byId('research-question').value.trim();
+        const code = byId('research-stock-code').value.trim();
+        if (!question || question.length > 1200 || (code && !/^\d{6}$/.test(code))) {
+            status.className = 'research-state is-error';
+            status.textContent = '请输入 1–1200 字的问题；股票代码留空或填写 6 位数字。';
+            return;
+        }
+        const mode = document.querySelector('input[name="research-mode"]:checked')?.value === 'experts' ? 'experts' : 'facts';
+        // A new explicit submission gets a new ID; transport never automatically retries.
+        const payload = {question, mode: mode, request_id: crypto.randomUUID()};
+        if (code) payload.stock_code = code;
+        let apiKey = '';
+        try {
+            apiKey = requestOperationKey(mode === 'experts' ? '按需专家研究（可能产生模型费用）' : '只读资料查询');
+            button.disabled = true;
+            busy(byId('research-form'), true);
+            status.textContent = mode === 'experts' ? '研究中：在限定轮次内核对不同视角，请勿重复提交…' : '查询中：汇总已有事实，不调用大模型…';
+            const data = await request('/api/research/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}, apiKey, 60000);
+            renderAnswer(data, question);
+            status.textContent = '已取得研究回答。请核对资料时间、来源与限制；未执行任何交易。';
+        } catch (error) {
+            status.className = 'research-state is-error';
+            status.textContent = error.message || '查询失败，请稍后重试。';
+        } finally {
+            apiKey = '';
+            button.disabled = false;
+            busy(byId('research-form'), false);
+        }
+    }
+    function initialize() {
+        byId('research-form').addEventListener('submit', submitQuestion);
+        byId('judgment-filter').addEventListener('submit', event => { event.preventDefault(); loadJudgments(); });
+        byId('research-refresh').addEventListener('click', loadOverview);
+        byId('experiments-refresh').addEventListener('click', loadExperiments);
+        document.querySelectorAll('[data-research-question]').forEach(button => button.addEventListener('click', () => {
+            byId('research-question').value = button.dataset.researchQuestion;
+            byId('research-question').focus();
+        }));
+        document.querySelectorAll('input[name="research-mode"]').forEach(input => input.addEventListener('change', () => {
+            byId('research-submit').textContent = input.value === 'experts' ? '开始专家研究' : '查询资料';
+        }));
+        if (window.isSecureContext !== true) byId('research-chat-status').textContent = '当前为 HTTP 连接：可以查看资料，提交查询前需配置 HTTPS。';
+    }
+    document.addEventListener('dashboard:viewchange', event => {
+        const view = event.detail?.viewId;
+        if (loaded.has(view)) return;
+        const loader = {research:loadOverview, judgments:loadJudgments, experiments:loadExperiments}[view];
+        if (loader) { loaded.add(view); loader(); }
+    });
+    document.addEventListener('DOMContentLoaded', initialize);
+})();

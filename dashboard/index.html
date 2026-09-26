@@ -253,6 +253,7 @@
             .stock-prices { grid-template-columns: 1fr 1fr; }
         }
     </style>
+    <link rel="stylesheet" href="/static/research.css">
 </head>
 <body>
     <div class="app-shell" id="app-shell">
@@ -278,6 +279,10 @@
                 <button class="sidebar-nav-item" type="button" data-view-target="tracking"><span class="nav-icon" aria-hidden="true">🎯</span><span>推荐跟踪</span></button>
                 <button class="sidebar-nav-item" type="button" data-view-target="weekly"><span class="nav-icon" aria-hidden="true">📊</span><span>每周回顾</span></button>
                 <button class="sidebar-nav-item" type="button" data-view-target="history"><span class="nav-icon" aria-hidden="true">📋</span><span>历史推荐</span></button>
+                <div class="nav-group">研究工作台</div>
+                <button class="sidebar-nav-item" type="button" data-view-target="research"><span class="nav-icon" aria-hidden="true">💬</span><span>研究助手</span></button>
+                <button class="sidebar-nav-item" type="button" data-view-target="judgments"><span class="nav-icon" aria-hidden="true">🔎</span><span>判断回放</span></button>
+                <button class="sidebar-nav-item" type="button" data-view-target="experiments"><span class="nav-icon" aria-hidden="true">🧪</span><span>经验与实验</span></button>
             </nav>
             <div class="sidebar-footnote">模拟研究系统，不构成投资建议。交易前仍须重新取价与风控。</div>
         </aside>
@@ -390,6 +395,55 @@
                         <div class="page-heading"><div><h1 id="page-title-history" tabindex="-1">📋 历史推荐</h1><p class="panel-summary" id="panel-summary-history">含后续表现跟踪</p></div></div>
                         <div class="card module-card"><div id="history"><div class="loading">加载中...</div></div></div>
                     </section>
+
+                    <section class="dashboard-view" data-view-panel="research" aria-labelledby="page-title-research" hidden>
+                        <div class="page-heading"><div><h1 id="page-title-research" tabindex="-1">研究助手</h1><p>先查证据，再看分歧。资料查询 · 非实时报价 · 不下单。</p></div><button class="btn btn-sm" type="button" id="research-refresh">刷新资料</button></div>
+                        <div class="research-notice">只读研究空间：回答不会修改策略、资金或持仓。多位专家的共识不代表独立验证，更不保证盈利。</div>
+                        <div id="research-overview" class="research-overview" aria-live="polite"><p class="research-state">加载中…</p></div>
+                        <div class="research-layout">
+                            <div class="card research-compose">
+                                <div class="research-eyebrow">从一个具体问题开始</div>
+                                <h2>让每次判断都有依据</h2>
+                                <p class="research-muted">查询已有记录、追问判断理由，或按需查看不同研究视角。缺少证据时明确说明，不补造历史。</p>
+                                <form id="research-form">
+                                    <label class="research-label" for="research-question">你的问题</label>
+                                    <textarea id="research-question" rows="4" maxlength="1200" required placeholder="例如：当前账户的主要风险是什么？哪些推荐还没有足够证据？"></textarea>
+                                    <div class="research-suggestions" aria-label="示例问题">
+                                        <button type="button" data-research-question="当前账户的主要风险和数据缺口是什么？">账户与数据风险</button>
+                                        <button type="button" data-research-question="最近的股票判断依据是什么？有哪些反面证据？">判断与反面证据</button>
+                                        <button type="button" data-research-question="哪些研究经验仍然只是待验证假设？">待验证的经验</button>
+                                    </div>
+                                    <label class="research-label" for="research-stock-code">股票代码 <span class="research-muted">（可选，6 位数字）</span></label>
+                                    <input id="research-stock-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="例如 600036" autocomplete="off">
+                                    <fieldset class="research-modes"><legend>回答方式</legend>
+                                        <label><input type="radio" name="research-mode" value="facts" checked><span><strong>事实查询</strong><small>本地记录汇总，不调用大模型</small></span></label>
+                                        <label><input type="radio" name="research-mode" value="experts"><span><strong>专家按需</strong><small>有限轮次的多角度研究，可能产生模型费用</small></span></label>
+                                    </fieldset>
+                                    <div class="research-submit-row"><button class="btn btn-primary" type="submit" id="research-submit">查询资料</button><span class="research-muted">提交时临时校验操作密钥，不会保存。</span></div>
+                                    <p id="research-chat-status" class="research-state" role="status" aria-live="polite"></p>
+                                </form>
+                            </div>
+                            <aside class="card research-guide" aria-labelledby="research-guide-title">
+                                <div class="research-eyebrow">研究边界</div><h2 id="research-guide-title">知道什么，也要知道不知道什么</h2>
+                                <ol><li><strong>核对资料时间</strong><p>资料截止时间不等于当前价格，旧判断不能直接当成今天的交易信号。</p></li><li><strong>区分事实与观点</strong><p>结论需能回到来源；反对意见与证据缺口也应保留。</p></li><li><strong>独立检验后再决策</strong><p>经验先作为假设，经过样本外验证与人工审核后，才讨论是否改策略。</p></li></ol>
+                            </aside>
+                        </div>
+                        <div id="research-answer" aria-live="polite"></div>
+                    </section>
+
+                    <section class="dashboard-view" data-view-panel="judgments" aria-labelledby="page-title-judgments" hidden>
+                        <div class="page-heading"><div><h1 id="page-title-judgments" tabindex="-1">判断回放</h1><p>回到当时的判断和证据；后来发生的事情，单独记录为复核。</p></div></div>
+                        <div class="research-notice">历史缺失会明确标记。事后导入的资料不能证明当时已经知道；本页不是回测收益报告。</div>
+                        <form id="judgment-filter" class="card research-filter"><label for="judgment-code">按股票代码筛选</label><input id="judgment-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="全部股票" autocomplete="off"><button class="btn btn-primary btn-sm" type="submit">查询记录</button><span class="research-muted">最近 30 条判断</span></form>
+                        <div class="research-replay-layout"><div id="research-judgments" aria-live="polite"><p class="research-state">加载中…</p></div><div id="research-judgment-detail" class="card research-detail" aria-live="polite"><div class="research-empty"><h2>选择一条判断</h2><p>查看原始观点、证据和后续复核。没有复核记录时，不自动判定对错。</p></div></div></div>
+                    </section>
+
+                    <section class="dashboard-view" data-view-panel="experiments" aria-labelledby="page-title-experiments" hidden>
+                        <div class="page-heading"><div><h1 id="page-title-experiments" tabindex="-1">经验与实验</h1><p>把失败变成可检验的问题，把改进留给独立的验证。</p></div><button class="btn btn-sm" type="button" id="experiments-refresh">刷新记录</button></div>
+                        <div class="research-notice">经验不自动改写策略；实验指标仅代表对应样本与成本假设。没有完整净值序列时，不展示推算的年化或夏普。</div>
+                        <div class="research-learning-path" aria-label="研究验证流程"><span><b>01</b>记录判断与证据</span><span><b>02</b>归纳待验证经验</span><span><b>03</b>独立实验与人工审核</span></div>
+                        <div class="research-learning-layout"><section class="card"><div class="research-section-heading"><h2>研究经验</h2><span class="research-badge">假设 ≠ 规则</span></div><p class="research-muted">保留形成时间、适用范围与验证状态。</p><div id="research-lessons" aria-live="polite"><p class="research-state">加载中…</p></div></section><section class="card"><div class="research-section-heading"><h2>验证实验</h2><span class="research-badge">结果 ≠ 承诺</span></div><p class="research-muted">查看已记录的验证结果，不伪造收益曲线。</p><div id="research-experiments" aria-live="polite"><p class="research-state">加载中…</p></div></section></div>
+                    </section>
                 </div>
             </main>
         </div>
@@ -425,7 +479,8 @@
     const DASHBOARD_VIEW_LABELS = {
         overview:'交易总览', recommendations:'今日推荐', sectors:'推荐板块', news:'今日要闻',
         positions:'当前持仓', trades:'自动操盘记录', control:'策略调控', asset:'资产分析',
-        tracking:'推荐跟踪', weekly:'每周回顾', history:'历史推荐'
+        tracking:'推荐跟踪', weekly:'每周回顾', history:'历史推荐',
+        research:'研究助手', judgments:'判断回放', experiments:'经验与实验'
     };
     let showingAllRecommendations = false;
     let expandedRecommendationDetails = new Set();
@@ -460,6 +515,7 @@
         }
         closeDashboardSidebar();
         if (focus) target?.querySelector('h1')?.focus({preventScroll:true});
+        document.dispatchEvent(new CustomEvent('dashboard:viewchange', {detail:{viewId}}));
     }
 
     function initializeDashboardNavigation() {
@@ -798,14 +854,18 @@
             }
         }
 
-        if (count) count.textContent = periodLabel ? `(${periodLabel})` : '';
+        const uniqueStockCount = new Set(allStocks.map(s => String(s.code || '').trim()).filter(Boolean)).size;
+        periodLabel = `${allStocks.length} 报告条目 · ${uniqueStockCount} 只去重股票`;
+        if (count) count.textContent = `(${periodLabel})`;
         const navCount = document.getElementById('nav-rec-count');
         if (navCount) {
             navCount.textContent = String(allStocks.length);
+            navCount.title = periodLabel;
+            navCount.setAttribute('aria-label', periodLabel);
             navCount.hidden = allStocks.length === 0;
         }
         const overviewSummary = document.getElementById('overview-rec-summary');
-        if (overviewSummary) overviewSummary.textContent = allStocks.length ? `${allStocks.length} 条推荐，可按报告时段筛选查看` : '当前暂无推荐数据';
+        if (overviewSummary) overviewSummary.textContent = allStocks.length ? `${periodLabel}；同一股票可出现在多个时段` : '当前暂无推荐数据';
 
         if (!allStocks.length) {
             el.innerHTML = '<div class="empty">暂无推荐数据<br><span style="font-size:12px;">运行 python cli.py daily --mode morning 生成推荐</span></div>';
@@ -1322,6 +1382,11 @@
     }
 
     // ============ RECOMMENDATION TRACKING ============
+    function formatCoverage(value) {
+        if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) return '待核验';
+        return `${Number(value)}%`;
+    }
+
     async function loadTracking() {
         const el = document.getElementById('tracking');
         try {
@@ -1332,7 +1397,7 @@
 
             const summary = data.summary || {};
             const tracks = data.tracks || [];
-            setPanelSummary('tracking', `胜率 ${summary.win_rate_pct||0}% · 执行覆盖 ${summary.execution_coverage_pct||0}% · 未触发 ${summary.not_triggered||0}`);
+            setPanelSummary('tracking', `胜率 ${summary.win_rate_pct||0}% · 执行覆盖 ${formatCoverage(summary.execution_coverage_pct)} · 未触发 ${summary.not_triggered||0}`);
 
             // Grade colors
             const gradeColors = {'A':'#27ae60','B':'#2196f3','C':'#ff9800','D':'#e74c3c','F':'#b71c1c'};
@@ -1341,7 +1406,7 @@
             let h = '<div class="summary-grid">';
             h += '<div class="summary-stat"><div class="label">总跟踪</div><div class="value">' + (summary.total_tracked||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">有效进场</div><div class="value">' + (summary.valid_samples||0) + '</div></div>';
-            h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + (summary.execution_coverage_pct||0) + '%</div></div>';
+            h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + formatCoverage(summary.execution_coverage_pct) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">已结束胜率</div><div class="value" style="color:' + ((summary.win_rate_pct||0)>=50?'#27ae60':'#e74c3c') + '">' + (summary.win_rate_pct||0) + '%</div></div>';
             h += '<div class="summary-stat"><div class="label">进场样本闭合</div><div class="value">' + (summary.sample_coverage_pct||0) + '%</div></div>';
             h += '<div class="summary-stat"><div class="label">达标</div><div class="value" style="color:#27ae60">' + (summary.hit_target||0) + '</div></div>';
@@ -1447,7 +1512,7 @@
                 h += '<div style="font-weight:600;font-size:14px;margin-bottom:8px;">📅 ' + esc(week.week_label||'') + '</div>';
                 h += '<div class="summary-grid">';
                 h += '<div class="summary-stat"><div class="label">跟踪数</div><div class="value">' + (week.total_tracked||0) + '</div></div>';
-                h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + (week.execution_coverage_pct||0) + '%</div></div>';
+                h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + formatCoverage(week.execution_coverage_pct) + '</div></div>';
                 h += '<div class="summary-stat"><div class="label">已结束胜率</div><div class="value" style="color:' + winColor + '">' + (week.win_rate_pct||0) + '%</div></div>';
                 h += '<div class="summary-stat"><div class="label">平均收益</div><div class="value" style="color:' + retColor + '">' + ((week.avg_return_pct||0)>=0?'+':'') + (week.avg_return_pct||0) + '%</div></div>';
                 h += '<div class="summary-stat"><div class="label">达标/止损</div><div class="value"><span style="color:#27ae60">' + (week.hit_target||0) + '</span>/<span style="color:#e74c3c">' + (week.stopped_out||0) + '</span></div></div>';
@@ -1794,5 +1859,6 @@
     });
     window.onload = bootstrap;
     </script>
+    <script src="/static/research.js"></script>
 </body>
 </html>

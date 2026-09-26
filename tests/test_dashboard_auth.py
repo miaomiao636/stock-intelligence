@@ -74,8 +74,8 @@ def test_dashboard_uses_sidebar_views_without_storing_credentials():
     assert 'class="app-shell"' in html
     assert 'class="sidebar"' in html
     assert 'aria-label="功能导航"' in html
-    assert html.count('class="sidebar-nav-item') == 11
-    assert html.count('<section class="dashboard-view"') == 11
+    assert html.count('class="sidebar-nav-item') == 14
+    assert html.count('<section class="dashboard-view"') == 14
     assert 'dashboardActiveViewV1' in html
     assert "function navigateDashboard" in html
     assert "function initializeDashboardNavigation" in html
