@@ -2,6 +2,7 @@
 """Recommendation Tracker - tracks performance of historical recommendations"""
 
 import json
+import math
 import sqlite3
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -85,21 +86,114 @@ class RecommendationTracker:
             and stock.get("trade_eligible", True) is not False
         )
 
-    def _load_previous_states(self, date_str: str) -> Dict[str, Dict]:
+    @staticmethod
+    def _is_date_name(value: str) -> bool:
+        try:
+            return len(value) == 10 and date.fromisoformat(value).isoformat() == value
+        except (ValueError, TypeError):
+            return False
+
+    def _tracking_files(self):
+        return sorted((path for path in self.tracker_dir.glob("*.json")
+                       if self._is_date_name(path.stem)), reverse=True)
+
+    @classmethod
+    def _safe_diagnostics(cls, values):
+        """Only propagate whitelisted relative file identities, never raw errors."""
+        result = []
+        if not isinstance(values, list):
+            return result
+        for item in values:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            parts = item["path"].split("/")
+            valid = (len(parts) == 2 and parts[0] == "tracker" and parts[1].endswith(".json")
+                     and cls._is_date_name(parts[1][:-5])) or (
+                         len(parts) == 3 and parts[0] == "recommendations"
+                         and cls._is_date_name(parts[1]) and parts[2] == "morning.json")
+            if not valid or item.get("kind") not in {"invalid_encoding", "invalid_json", "invalid_schema", "read_error"}:
+                continue
+            safe = {"path": item["path"], "kind": item["kind"]}
+            if isinstance(item.get("offset"), int) and item["offset"] >= 0:
+                safe["offset"] = item["offset"]
+            if safe not in result:
+                result.append(safe)
+        return result
+
+    def _read_json(self, path, field, diagnostics):
+        """Reject malformed inputs per file; leave the original bytes untouched."""
+        def finite_number(value):
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("non-finite JSON number")
+            return number
+
+        error = None
+        try:
+            if path.is_symlink():
+                raise OSError("symbolic links are not tracking inputs")
+            payload = json.loads(path.read_text(encoding="utf-8"),
+                                 parse_constant=finite_number, parse_float=finite_number)
+        except UnicodeDecodeError as exc:
+            error = {"kind": "invalid_encoding", "offset": exc.start}
+        except json.JSONDecodeError as exc:
+            error = {"kind": "invalid_json", "offset": exc.pos}
+        except ValueError:
+            error = {"kind": "invalid_json"}
+        except OSError:
+            error = {"kind": "read_error"}
+        else:
+            if (not isinstance(payload, dict) or not isinstance(payload.get(field), list)
+                    or any(not isinstance(row, dict) for row in payload[field])
+                    or (field == "tracks" and not isinstance(payload.get("summary", {}), dict))):
+                error = {"kind": "invalid_schema"}
+            else:
+                return payload
+        diagnostic = {"path": path.relative_to(self.data_dir).as_posix(), **error}
+        diagnostics.extend(self._safe_diagnostics([diagnostic]))
+        return None
+
+    def _with_quality(self, payload, diagnostics):
+        result = dict(payload)
+        previous = result.get("data_quality")
+        previous = previous if isinstance(previous, dict) else {}
+        inherited = previous.get("diagnostics")
+        inherited = inherited if isinstance(inherited, list) else []
+        issues = self._safe_diagnostics([*inherited, *diagnostics])
+        incomplete = bool(issues or previous.get("history_incomplete") or previous.get("status") == "incomplete")
+        result["data_quality"] = {"status": "incomplete" if incomplete else "ok",
+                                  "history_incomplete": incomplete, "diagnostics": issues,
+                                  "scope": "file_integrity_only"}
+        result["summary"] = dict(result.get("summary") or {})
+        if incomplete:
+            result["summary"]["statistics_trustworthy"] = False
+        if incomplete and result.get("status") != "error":
+            result["status"] = "partial_success"
+        else:
+            result.setdefault("status", "success")
+        return result
+
+    def _load_previous_states(self, date_str: str, diagnostics=None, state_dates=None) -> Dict[str, Dict]:
         """Load the newest known state for every recommendation up to date_str."""
         states: Dict[str, Dict] = {}
+        diagnostics = diagnostics if diagnostics is not None else []
+        state_dates = state_dates if state_dates is not None else {}
         if not self.tracker_dir.exists():
             return states
-        for path in sorted(self.tracker_dir.glob("*.json"), reverse=True):
+        for path in self._tracking_files():
             if path.stem > date_str:
                 continue
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            payload = self._read_json(path, "tracks", diagnostics)
+            if payload is None:
                 continue
+            quality = payload.get("data_quality")
+            if isinstance(quality, dict):
+                diagnostics.extend(self._safe_diagnostics(quality.get("diagnostics")))
             for track in payload.get("tracks", []):
                 key = f"{track.get('recommendation_date', '')}:{track.get('code', '')}"
-                states.setdefault(key, track)
+                if key not in states:
+                    states[key] = track
+                    state_dates[key] = path.stem
         return states
 
     def track_daily(self, date_str: str = None) -> Dict:
@@ -116,14 +210,17 @@ class RecommendationTracker:
 
         all_tracks = []
         excluded_non_actionable = 0
-        previous_states = self._load_previous_states(date_str)
+        diagnostics, state_dates = [], {}
+        previous_states = self._load_previous_states(date_str, diagnostics, state_dates)
+        damaged_dates = [item["path"].split("/")[1][:-5] for item in diagnostics
+                         if item["path"].startswith("tracker/")]
 
         # Scan all recommendation dates
         if not self.recommendations_dir.exists():
-            return {"status": "no_data", "tracks": []}
+            return self._with_quality({"status": "no_data", "tracks": []}, diagnostics)
 
         for rec_dir in sorted(self.recommendations_dir.iterdir()):
-            if not rec_dir.is_dir():
+            if not rec_dir.is_dir() or rec_dir.is_symlink() or not self._is_date_name(rec_dir.name):
                 continue
             rec_date = rec_dir.name
             if rec_date > date_str:
@@ -134,10 +231,8 @@ class RecommendationTracker:
             if not morning_file.exists():
                 continue
 
-            try:
-                with open(morning_file) as f:
-                    rec = json.load(f)
-            except (json.JSONDecodeError, IOError):
+            rec = self._read_json(morning_file, "stock_recommendations", diagnostics)
+            if rec is None:
                 continue
 
             stocks = rec.get("stock_recommendations", [])
@@ -155,6 +250,17 @@ class RecommendationTracker:
                     # A terminal outcome is immutable. A later price must not
                     # turn a previous hit/stop back into an active sample.
                     track = dict(previous)
+                elif (previous and previous.get("history_incomplete")) or any(
+                        rec_date <= day and state_dates.get(key, "") < day for day in damaged_dates):
+                    track = self._unscored_track(
+                        stock=stock, rec_date=rec_date, today=date_str, status="history_incomplete",
+                        execution_status="unknown", planned_entry_price=self._number(stock.get("entry_price")),
+                        target_price=self._number(stock.get("target_price")),
+                        stop_price=self._number(stock.get("stop_loss_price")),
+                        horizon=stock.get("horizon", "short"),
+                        horizon_days=max(1, int(self._number(stock.get("horizon_days"), 3) or 3)),
+                        reason="历史跟踪文件损坏，无法确认期间触发或终结状态；原件保留，暂不计入收益。")
+                    track["history_incomplete"] = True
                 else:
                     track = self._track_stock(
                         stock,
@@ -177,7 +283,12 @@ class RecommendationTracker:
             "summary": self._calculate_summary(all_tracks),
         }
 
-        self._save_tracking(result, date_str)
+        result = self._with_quality(result, diagnostics)
+        # A damaged target file is evidence, not an output slot to overwrite.
+        target_path = f"tracker/{date_str}.json"
+        result["persisted"] = not any(item["path"] == target_path for item in diagnostics)
+        if result["persisted"]:
+            self._save_tracking(result, date_str)
         return result
 
     def _track_stock(
@@ -757,24 +868,31 @@ class RecommendationTracker:
         """Get tracking data for a date"""
         if date_str is None:
             date_str = date.today().isoformat()
+        if not self._is_date_name(date_str):
+            return None
         track_file = self.tracker_dir / f"{date_str}.json"
         if not track_file.exists():
             return None
-        try:
-            with open(track_file) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return None
+        diagnostics = []
+        payload = self._read_json(track_file, "tracks", diagnostics)
+        return self._with_quality(payload if payload is not None else {
+            "status": "error", "tracking_date": date_str, "tracks": [], "summary": {}}, diagnostics)
 
     def get_latest_tracking(self) -> Optional[Dict]:
         """Get the most recent tracking data"""
-        files = sorted(self.tracker_dir.glob("*.json"), reverse=True)
-        for f in files[:3]:
-            try:
-                with open(f) as fh:
-                    return json.load(fh)
-            except (json.JSONDecodeError, IOError):
-                continue
+        files = self._tracking_files()
+        diagnostics = []
+        for path in files:
+            payload = self._read_json(path, "tracks", diagnostics)
+            if payload is not None:
+                result = self._with_quality(payload, diagnostics)
+                result["requested_tracking_date"] = files[0].stem
+                if path != files[0]:
+                    result["fallback_from"] = files[0].stem
+                return result
+        if diagnostics:
+            return self._with_quality({"status": "error", "tracking_date": None,
+                "requested_tracking_date": files[0].stem, "tracks": [], "summary": {}}, diagnostics)
         return None
 
     def get_weekly_review(self, weeks: int = 4) -> List[Dict]:
@@ -788,15 +906,18 @@ class RecommendationTracker:
             week_start = week_end - timedelta(days=6)
 
             week_tracks = []
+            diagnostics = []
 
             # Collect all tracks within this week
             for d in range(7):
                 day = week_start + timedelta(days=d)
                 track_data = self.get_tracking(day.isoformat())
+                if track_data:
+                    diagnostics.extend(track_data.get("data_quality", {}).get("diagnostics", []))
                 if track_data and track_data.get("tracks"):
                     week_tracks.extend(track_data["tracks"])
 
-            if not week_tracks:
+            if not week_tracks and not diagnostics:
                 continue
 
             # Deduplicate daily snapshots by recommendation identity. The same
@@ -808,6 +929,9 @@ class RecommendationTracker:
             unique_tracks = list(seen.values())
 
             summary = self._calculate_summary(unique_tracks)
+            quality = self._with_quality({"summary": summary}, diagnostics)
+            summary = quality["summary"]
+            summary["data_quality"] = quality["data_quality"]
             summary["week_start"] = week_start.isoformat()
             summary["week_end"] = week_end.isoformat()
             summary["week_label"] = f"{week_start.isoformat()} ~ {week_end.isoformat()}"
@@ -839,6 +963,9 @@ class RecommendationTracker:
     def get_improvement_suggestions(self) -> List[Dict]:
         """Analyze tracking data and suggest improvements"""
         tracking = self.get_latest_tracking()
+        if tracking and tracking.get("data_quality", {}).get("history_incomplete"):
+            return [{"type": "data_quality", "priority": "high",
+                     "message": "跟踪历史不完整，先核查损坏文件和缺失状态；当前不生成基于胜率或收益的调参建议。"}]
         if not tracking or not tracking.get("tracks"):
             return []
 
