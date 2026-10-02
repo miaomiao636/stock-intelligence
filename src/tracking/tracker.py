@@ -65,12 +65,18 @@ class RecommendationTracker:
 
     @staticmethod
     def _number(value, default=0):
-        if value is None:
+        if value is None or isinstance(value, bool):
             return default
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            number = float(value)
+            return number if math.isfinite(number) else default
+        except (TypeError, ValueError, OverflowError):
             return default
+
+    @staticmethod
+    def _is_finite_return(value):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and RecommendationTracker._number(value, None) is not None)
 
     @staticmethod
     def _is_actionable(stock: Dict) -> bool:
@@ -145,7 +151,10 @@ class RecommendationTracker:
         else:
             if (not isinstance(payload, dict) or not isinstance(payload.get(field), list)
                     or any(not isinstance(row, dict) for row in payload[field])
-                    or (field == "tracks" and not isinstance(payload.get("summary", {}), dict))):
+                    or (field == "tracks" and (
+                        not isinstance(payload.get("summary", {}), dict)
+                        or (payload.get("tracking_date") is not None
+                            and payload["tracking_date"] != path.stem)))):
                 error = {"kind": "invalid_schema"}
             else:
                 return payload
@@ -165,9 +174,21 @@ class RecommendationTracker:
                                   "history_incomplete": incomplete, "diagnostics": issues,
                                   "scope": "file_integrity_only"}
         result["summary"] = dict(result.get("summary") or {})
-        if incomplete:
+        tracks = result.get("tracks", [])
+        data_errors = sum(track.get("status") == "data_error" for track in tracks)
+        history_gaps = sum(track.get("status") == "history_incomplete" for track in tracks)
+        ambiguous = sum(track.get("status") == "path_ambiguous" for track in tracks)
+        evaluation_incomplete = bool(data_errors or history_gaps or ambiguous)
+        result["tracking_quality"] = {
+            "status": "incomplete" if evaluation_incomplete else "complete",
+            "data_error_samples": data_errors,
+            "history_incomplete_samples": history_gaps,
+            "path_ambiguous_samples": ambiguous,
+            "scope": "evaluation_coverage_only",
+        }
+        if incomplete or evaluation_incomplete:
             result["summary"]["statistics_trustworthy"] = False
-        if incomplete and result.get("status") != "error":
+        if (incomplete or evaluation_incomplete) and result.get("status") != "error":
             result["status"] = "partial_success"
         else:
             result.setdefault("status", "success")
@@ -262,13 +283,30 @@ class RecommendationTracker:
                         reason="历史跟踪文件损坏，无法确认期间触发或终结状态；原件保留，暂不计入收益。")
                     track["history_incomplete"] = True
                 else:
-                    track = self._track_stock(
-                        stock,
-                        rec_date,
-                        date_str,
-                        previous=previous,
-                        recommendation=rec,
-                    )
+                    try:
+                        track = self._track_stock(
+                            stock,
+                            rec_date,
+                            date_str,
+                            previous=previous,
+                            recommendation=rec,
+                        )
+                    except Exception:
+                        # Isolate one malformed candidate or dependency failure.
+                        # Do not turn a failed lookup into a theoretical entry,
+                        # and do not let this row prevent a daily artifact.
+                        track = self._unscored_track(
+                            stock=stock, rec_date=rec_date, today=date_str,
+                            status="data_error",
+                            execution_status=(previous or {}).get("execution_status", "unknown"),
+                            planned_entry_price=self._number(stock.get("entry_price")),
+                            target_price=self._number(stock.get("target_price")),
+                            stop_price=self._number(stock.get("stop_loss_price")),
+                            horizon=stock.get("horizon", "short"),
+                            horizon_days=max(1, int(self._number(stock.get("horizon_days"), 3) or 3)),
+                            reason="单条跟踪计算失败，未计算收益；请核查该候选和依赖数据。",
+                            previous=previous,
+                        )
                     if track.get("status") in self.TERMINAL_STATUSES:
                         track["terminal_at"] = datetime.now().isoformat()
                 all_tracks.append(track)
@@ -370,11 +408,19 @@ class RecommendationTracker:
                 tracking_age_days=tracking_age_days,
             )
 
-        market_data = self._fetch_market_data(code, today)
+        try:
+            market_data = self._fetch_market_data(code, today)
+        except Exception:
+            # Provider failures belong to this candidate; never publish raw
+            # exceptions that may contain URLs, credentials or response bodies.
+            market_data = {"error": "market_data_provider_failed"}
+        if not isinstance(market_data, dict):
+            market_data = {"error": "market_data_invalid_shape"}
         if market_data.get("error") or market_data.get("date") != today:
-            reason = market_data.get("error") or (
-                f"行情日期{market_data.get('date') or '缺失'}与目标日期{today}不一致"
-            )
+            # Some collectors return raw exception text inside an error dict;
+            # those strings and source URLs may contain request credentials.
+            reason = ("market_data_provider_failed" if market_data.get("error")
+                      else "market_data_date_mismatch")
             return self._unscored_track(
                 stock=stock,
                 rec_date=rec_date,
@@ -388,15 +434,18 @@ class RecommendationTracker:
                 horizon_days=horizon_days,
                 reason=reason,
                 tracking_age_days=tracking_age_days,
-                data=market_data,
+                data={"date": market_data.get("date")
+                      if self._is_date_name(market_data.get("date")) else ""},
                 previous=previous,
             )
 
         day_open = self._number(market_data.get("open"), 0)
         current_price = self._number(market_data.get("close"), 0)
-        day_high = self._number(market_data.get("high"), current_price)
-        day_low = self._number(market_data.get("low"), current_price)
-        if current_price <= 0 or day_high <= 0 or day_low <= 0:
+        day_high = self._number(market_data.get("high"), 0)
+        day_low = self._number(market_data.get("low"), 0)
+        if (min(day_open, current_price, day_high, day_low) <= 0
+                or not day_low <= day_open <= day_high
+                or not day_low <= current_price <= day_high):
             return self._unscored_track(
                 stock=stock,
                 rec_date=rec_date,
@@ -768,7 +817,7 @@ class RecommendationTracker:
         scoreable = [
             t for t in tracks
             if t.get("execution_status") in self.ENTERED_EXECUTION_STATUSES
-            and isinstance(t.get("actual_return_pct"), (int, float))
+            and self._is_finite_return(t.get("actual_return_pct"))
         ]
         valid_total = len(scoreable)
         hit = sum(1 for t in scoreable if t.get("status") == "hit_target")
@@ -799,13 +848,13 @@ class RecommendationTracker:
         # Sector performance must never include recommendations without an entry.
         sector_stats = {}
         for t in scoreable:
-            s = t.get("sector", "未知")
+            s = str(t.get("sector") or "未知")
             if s not in sector_stats:
                 sector_stats[s] = {"total": 0, "hit": 0, "failed": 0, "returns": []}
             sector_stats[s]["total"] += 1
-            if t["is_met_expectation"]:
+            if t.get("status") == "hit_target":
                 sector_stats[s]["hit"] += 1
-            if t["is_failed"]:
+            if t.get("status") in {"stopped_out", "deep_loss", "expired"}:
                 sector_stats[s]["failed"] += 1
             sector_stats[s]["returns"].append(float(t["actual_return_pct"]))
 
@@ -858,7 +907,7 @@ class RecommendationTracker:
         temp_file = track_file.with_suffix(".tmp")
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+                json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
             os.replace(str(temp_file), str(track_file))
         except IOError as e:
             print(f"⚠️ 保存跟踪数据失败: {e}")
@@ -929,9 +978,10 @@ class RecommendationTracker:
             unique_tracks = list(seen.values())
 
             summary = self._calculate_summary(unique_tracks)
-            quality = self._with_quality({"summary": summary}, diagnostics)
+            quality = self._with_quality({"summary": summary, "tracks": unique_tracks}, diagnostics)
             summary = quality["summary"]
             summary["data_quality"] = quality["data_quality"]
+            summary["tracking_quality"] = quality["tracking_quality"]
             summary["week_start"] = week_start.isoformat()
             summary["week_end"] = week_end.isoformat()
             summary["week_label"] = f"{week_start.isoformat()} ~ {week_end.isoformat()}"
@@ -939,7 +989,7 @@ class RecommendationTracker:
             # Top winners and losers
             scored_tracks = [
                 t for t in unique_tracks
-                if isinstance(t.get("actual_return_pct"), (int, float))
+                if self._is_finite_return(t.get("actual_return_pct"))
             ]
             sorted_tracks = sorted(
                 scored_tracks,
@@ -966,6 +1016,15 @@ class RecommendationTracker:
         if tracking and tracking.get("data_quality", {}).get("history_incomplete"):
             return [{"type": "data_quality", "priority": "high",
                      "message": "跟踪历史不完整，先核查损坏文件和缺失状态；当前不生成基于胜率或收益的调参建议。"}]
+        if tracking:
+            from src.research.health import tracking_freshness
+            freshness = tracking_freshness(tracking, today=date.today())
+            if freshness["status"] != "recent_unverified":
+                return [{"type": "data_freshness", "priority": "high",
+                         "message": "跟踪时间过旧、缺失或无效，先核查更新情况；不据此生成调参建议。自然日间隔不单独证明任务故障。"}]
+            if tracking.get("tracking_quality", {}).get("status") == "incomplete":
+                return [{"type": "data_quality", "priority": "high",
+                         "message": "存在行情错误、历史触发缺口或路径未决样本；先补齐证据，不据不完整结果调参。"}]
         if not tracking or not tracking.get("tracks"):
             return []
 
