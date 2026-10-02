@@ -1,6 +1,7 @@
 """Contracts for the read-only research workspace and safe evidence rendering."""
 
 from html.parser import HTMLParser
+from hashlib import sha256
 from pathlib import Path
 
 
@@ -26,8 +27,11 @@ def test_research_pages_have_matching_navigation_and_accessible_headings():
         assert len(panels) == 1
         assert "hidden" in panels[0]
         assert any(a.get("id") == panels[0]["aria-labelledby"] for _, a in elements)
-    assert 'href="/static/research.css"' in html
-    assert 'src="/static/research.js"' in html
+    for name, attribute in (("research.css", "href"), ("research.js", "src")):
+        version = sha256((DASHBOARD / name).read_bytes()).hexdigest()[:12]
+        assert any(a.get(attribute) == f"/static/{name}?v={version}" for _, a in elements), (
+            "Changed research assets must use a new content version, not a stale browser cache"
+        )
     assert "dashboard:viewchange" in html
 
 
