@@ -2,7 +2,7 @@
 (() => {
     'use strict';
     const loaded = new Set();
-    const sequences = {judgments: 0, detail: 0, experiments: 0, research: 0};
+    const sequences = {judgments: 0, detail: 0, experiments: 0, research: 0, diagnostics: 0};
     const byId = id => document.getElementById(id);
     const list = value => Array.isArray(value) ? value : [];
     function itemsFrom(data) {
@@ -26,7 +26,17 @@
         filled:'已模拟成交', expired:'已过期', watching:'观察中', pending_trigger:'等待触发', ready:'条件就绪',
         correct:'方向正确', incorrect:'方向错误', inconclusive:'无法判断', not_triggered:'未触发',
         closed:'已平仓', theoretical_trigger:'理论触发（非账户成交）', unknown:'未知',
-        unavailable:'无可核验损益', realized:'已实现', unrealized:'未实现', retired:'已停用', recorded:'已归档'};
+        unavailable:'无可核验损益', realized:'已实现', unrealized:'未实现', retired:'已停用', recorded:'已归档',
+        explicit_forecast_missing:'未明确记录预测方向或期限', forecast_input_snapshot_missing:'缺少模型输入行情快照',
+        reference_quote_missing:'缺少可核验的预测基准价', reference_quote_from_future:'基准行情晚于判断时点',
+        reference_price_basis_unknown:'基准价格口径不明', not_recorded_on_forecast_day:'并非判断当日留档',
+        reference_evidence_mismatch:'基准价与引用证据不一致',
+        not_recorded_at_forecast_time:'未在判断时点及时留档', reference_quote_stale:'判断基准行情已过期',
+        same_stock_day_horizon_repeat:'同股票同日同期限重复', target_close_unavailable:'缺少到期收盘行情',
+        target_date_mismatch:'行情不是指定到期日', invalid_close:'收盘价无效', observation_time_invalid:'到期行情时间无效',
+        observation_source_missing:'到期行情来源缺失', price_adjustment_unverified:'尚未核验除权除息',
+        invalid_return:'价格变化无法有效计算',
+        corporate_action_requires_adjusted_reference:'期间发生除权除息，暂不按原始价评分'};
     const label = value => labels[value] || text(value) || '未标注';
     function state(target, message, error = false) {
         target.replaceChildren(element('p', `research-state${error ? ' is-error' : ''}`, message));
@@ -140,6 +150,137 @@
         } finally { window.clearTimeout(timer); }
     }
     const failure = (target, error) => state(target, `加载失败：${error.message || '请检查连接后重试。'}`, true);
+    const diagnosticTargets = () => [byId('overview-diagnostics'), byId('research-diagnostics')].filter(Boolean);
+    const countText = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? String(value) : '--';
+    function diagnosticCell(name, value, note, warning = false) {
+        const cell = element('div', 'research-diagnostic-cell');
+        cell.append(element('h3', '', name), element('strong', warning ? 'is-warning' : '', value), element('p', '', note));
+        return cell;
+    }
+    function scorecardPercent(value, evaluable) {
+        return Number.isFinite(evaluable) && evaluable > 0 && typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
+            ? `${value.toFixed(1)}%` : '--';
+    }
+    function predictionSummary(scorecard) {
+        const summary = scorecard?.summary;
+        if (!summary) return diagnosticCell('预测评估', '--', '暂无可核验的预测成绩；不能用报告数量代替准确率。');
+        return diagnosticCell('方向正确率', scorecardPercent(summary.accuracy_pct, summary.evaluable),
+            `可评估 ${countText(summary.evaluable)} · 待到期/待复核 ${countText(summary.pending)} · 未纳入 ${countText(summary.excluded)}`);
+    }
+    function predictionDetails(scorecard) {
+        const details = fold('预测评估口径与各观察窗口', 'research-diagnostic-details research-scorecard-details');
+        const body = element('div', 'research-diagnostic-detail-body');
+        if (!scorecard?.summary) {
+            body.append(element('p', 'research-muted', '尚无预测评估档案：需要保留当时判断、观察窗口及可核验的后续行情；不以账户收益或报告数量代替。'));
+            details.append(body);
+            return details;
+        }
+        const summary = scorecard.summary;
+        body.append(element('p', 'research-muted', `评估截至 ${text(scorecard.as_of) || '未提供'} · 协议 ${text(scorecard.protocol_version) || '未提供'}`));
+        body.append(element('p', 'research-muted', '方向统计不是收益率，也不是独立样本外验证；重叠观察窗口不能当成独立样本。按同股票、日期和窗口去重后评估。'));
+        const counts = element('dl', 'research-metrics');
+        [['已记录',summary.records_total],['可评估',summary.evaluable],['方向正确',summary.correct],['方向错误',summary.incorrect],
+            ['待到期/待复核',summary.pending],['到期但结果不可核验',summary.unavailable],['未纳入评估',summary.excluded],['重复记录',summary.duplicate]]
+            .forEach(([name, value]) => counts.append(element('dt', '', name),element('dd', '', countText(value))));
+        counts.append(element('dt', '', '可评估覆盖率'), element('dd', '', scorecardPercent(summary.coverage_pct, summary.eligible)));
+        body.append(counts, element('p', 'research-muted', `同批始终预测上涨的正确率：${scorecardPercent(summary.always_up_accuracy_pct, summary.evaluable)}。不高于此基线，不能证明选股有效。`));
+        const rows = list(scorecard.by_horizon);
+        if (rows.length) {
+            const wrap = element('div', 'research-scorecard-table-wrap');
+            const table = element('table', 'research-scorecard-table');
+            const head = element('thead'), tr = element('tr');
+            ['观察窗口', '可评估', '方向正确率', '始终预测上涨'].forEach(name => {const th = element('th', '', name); th.scope = 'col'; tr.append(th);});
+            head.append(tr);
+            table.append(element('caption', '', '各窗口分别统计；-- 表示没有可核验结果'), head);
+            const tbody = element('tbody');
+            rows.forEach(row => {
+                const stats = row.summary || {}, line = element('tr');
+                const name = Number.isInteger(row.horizon_sessions) && row.horizon_sessions > 0 ? `${row.horizon_sessions} 个交易日` : '窗口未明确';
+                const th = element('th', '', name); th.scope = 'row';
+                line.append(th, element('td', '', countText(stats.evaluable)), element('td', '', scorecardPercent(stats.accuracy_pct, stats.evaluable)),
+                    element('td', '', scorecardPercent(stats.always_up_accuracy_pct, stats.evaluable)));
+                tbody.append(line);
+            });
+            table.append(tbody); wrap.append(table); body.append(wrap);
+        }
+        const reasons = Object.entries(scorecard.exclusion_reasons || {});
+        if (reasons.length) {
+            const ul = element('ul', 'research-sources');
+            reasons.forEach(([reason, count]) => ul.append(element('li', '', `${label(reason)} · ${countText(count)} 条`)));
+            body.append(element('h3', 'research-subheading', '未纳入的原因'), ul);
+        }
+        limitations(body, scorecard.limitations);
+        details.append(body);
+        return details;
+    }
+    function renderDiagnostics(target, data) {
+        const heading = element('div', 'research-section-heading');
+        const refresh = element('button', 'btn btn-sm', '刷新');
+        refresh.type = 'button';
+        refresh.setAttribute('aria-label', '刷新运行与评估');
+        refresh.addEventListener('click', loadDiagnostics);
+        heading.append(element('h2', '', '运行与评估'), refresh);
+        const grid = element('div', 'research-diagnostic-grid');
+        const tracking = data.tracking || {}, freshness = tracking.freshness || {};
+        const stale = freshness.status === 'stale';
+        const samplesIncomplete = tracking.tracking_quality?.status === 'incomplete';
+        const incomplete = tracking.data_quality?.status === 'incomplete' || samplesIncomplete;
+        const trackingLabel = tracking.available === false ? '暂无跟踪记录' : stale ? '跟踪已过期' : samplesIncomplete ? '跟踪样本不完整' : incomplete ? '历史不完整' : freshness.status === 'fresh' ? '跟踪已更新' : freshness.status === 'recent_unverified' ? '近期记录 · 待核验' : '更新时间待核验';
+        let trackingNote = tracking.tracking_date ? `记录日期 ${text(tracking.tracking_date)}` : '没有可核验的跟踪日期';
+        if (stale && countText(freshness.age_calendar_days) !== '--') trackingNote += ` · 距今 ${freshness.age_calendar_days} 个自然日`;
+        if (stale || incomplete) trackingNote += '；暂不据此评价当前胜率。';
+        grid.append(diagnosticCell('跟踪质量', trackingLabel, trackingNote, stale || incomplete || tracking.available === false));
+        const execution = data.execution || {}, summary = execution.summary || {};
+        const hasPlans = typeof summary.total === 'number' && summary.total > 0 && Boolean(execution.trade_date);
+        const historical = hasPlans && execution.trade_date !== execution.requested_date;
+        const statuses = Object.entries(summary.by_status || {}).map(([key, value]) => `${label(key)} ${countText(value)}`).join(' · ');
+        grid.append(diagnosticCell('计划与执行', hasPlans ? `${execution.trade_date} · ${countText(summary.total)} 条` : '暂无计划记录',
+            hasPlans ? `${historical ? '最近有记录的日期，非今日；' : '指定日期的归档记录；'}${statuses || '状态待核验'}` : '未归档不等于没有机会或执行失败。'));
+        grid.append(predictionSummary(data.scorecard));
+        const detail = fold('查看未成交原因与数据说明', 'research-diagnostic-details');
+        const body = element('div', 'research-diagnostic-detail-body');
+        body.append(element('h3', 'research-subheading', '为什么没有成交？'));
+        if (hasPlans) {
+            body.append(element('p', 'research-muted', `计划日期 ${text(execution.trade_date)}；查询日期 ${text(execution.requested_date) || '未提供'}。只解释该批归档计划，不代表当前账户收益。`));
+            const reasons = Object.entries(summary.reason_counts || {});
+            if (reasons.length) {
+                const ul = element('ul', 'research-sources');
+                reasons.forEach(([reason, count]) => ul.append(element('li', '', `${reason} · ${countText(count)} 条`)));
+                body.append(ul);
+            } else body.append(element('p', 'research-muted', '没有已归档原因，不能自动归因于市场、风控或系统故障。'));
+        } else body.append(element('p', 'research-muted', '暂无计划记录。未归档不等于零失败，也不能据此认定没有触价或没有成交。'));
+        if (execution.note) body.append(element('p', 'research-muted', execution.note));
+        if (samplesIncomplete) {
+            const quality = tracking.tracking_quality;
+            body.append(element('p', 'research-muted', `跟踪样本：行情错误 ${countText(quality.data_error_samples)} · 历史缺口 ${countText(quality.history_incomplete_samples)} · 路径不明 ${countText(quality.path_ambiguous_samples)}。文件可读取不等于样本可评估。`));
+        }
+        body.append(element('p', 'research-muted', '跟踪是否及时、计划是否成交与预测是否正确是三个不同的问题；这里不会补造历史交易或收益。'));
+        detail.append(body);
+        target.replaceChildren(heading, grid, element('p', 'research-diagnostic-boundary', '预测成绩不等于账户收益；没有有效样本时显示 --，不显示 0% 或假定正确。'), detail, predictionDetails(data.scorecard),
+            element('p', 'research-diagnostic-asof', `本次查询：${text(data.as_of) || '未提供'}（不是行情更新时间）`));
+    }
+    async function loadDiagnostics() {
+        const seq = ++sequences.diagnostics;
+        const targets = diagnosticTargets();
+        targets.forEach(target => {busy(target, true); state(target, '加载中：核对跟踪与执行记录…');});
+        try {
+            const data = await request('/api/research/diagnostics');
+            if (seq !== sequences.diagnostics) return;
+            if (!data.tracking || !data.execution || !Number.isInteger(data.execution.summary?.total) || data.execution.summary.total < 0) {
+                throw new Error('运行诊断结构不完整，不能判定当前状态。');
+            }
+            targets.forEach(target => renderDiagnostics(target, data));
+        } catch (error) {
+            if (seq !== sequences.diagnostics) return;
+            targets.forEach(target => {
+                failure(target, error);
+                const retry = element('button', 'btn btn-sm', '重试');
+                retry.type = 'button';
+                retry.addEventListener('click', loadDiagnostics);
+                target.append(retry);
+            });
+        } finally {if (seq === sequences.diagnostics) targets.forEach(target => busy(target, false));}
+    }
     async function loadOverview() {
         const target = byId('research-overview');
         const seq = ++sequences.research;
@@ -400,7 +541,7 @@
     function initialize() {
         byId('research-form').addEventListener('submit', submitQuestion);
         byId('judgment-filter').addEventListener('submit', event => { event.preventDefault(); loadJudgments(); });
-        byId('research-refresh').addEventListener('click', loadOverview);
+        byId('research-refresh').addEventListener('click', () => {loadOverview(); loadDiagnostics();});
         byId('experiments-refresh').addEventListener('click', loadExperiments);
         document.querySelectorAll('[data-research-question]').forEach(button => button.addEventListener('click', () => {
             byId('research-question').value = button.dataset.researchQuestion;
@@ -410,6 +551,7 @@
             byId('research-submit').textContent = input.value === 'experts' ? '开始专家研究' : '查询资料';
         }));
         if (window.isSecureContext !== true) byId('research-chat-status').textContent = '当前为 HTTP 连接：可以查看资料，提交查询前需配置 HTTPS。';
+        loadDiagnostics();
     }
     document.addEventListener('dashboard:viewchange', event => {
         const view = event.detail?.viewId;

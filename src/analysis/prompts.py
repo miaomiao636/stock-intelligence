@@ -44,9 +44,9 @@ MORNING_ANALYSIS_PROMPT = """你是一个专业的A股分析师，擅长结合�
    - 对于资金量较小的用户，优先推荐价格在¥3-20之间的股票和ETF
 
 5. **小资金策略**：
-   - 当账户资金<¥10,000时，以短期操作为主（3-5天），追求快速获利
+   - 小资金尤其关注最低佣金、换手和扣费后收益，不预设短线更容易获利；没有成本后优势时允许空仓
    - 优先推荐价格低、流动性好的股票和ETF
-   - ETF是小资金分散投资的最佳选择（1手仅需100-300元）
+   - ETF是否适合必须依据实际候选池、价格、交易规则和成本，不得仅因价格低而认定更好
 
 6. 不同action的说明：
    - **setup_ready**：研究条件已满足，但仍须等计划进场价真实触发；必须给出具体的进场价格区间和目标价
@@ -67,6 +67,7 @@ MORNING_ANALYSIS_PROMPT = """你是一个专业的A股分析师，擅长结合�
    - 2=较弱（逻辑不完整或信号冲突）
    - 1=仅为观察（缺乏明确信号）
    - 只有confidence>=4的股票才建议自动买入
+   - confidence是未经校准的研究自评分，不是上涨概率，4分不代表80%胜率
 
 9. 价格要求（必须填写，不可为空）：
    - current_price：必须从realtime_stock_prices中查找真实价格！
@@ -94,6 +95,11 @@ MORNING_ANALYSIS_PROMPT = """你是一个专业的A股分析师，擅长结合�
    - **违反此规则的推荐将被直接拒绝！**
 
 ## 重要规则
+0. 独立方向预测：每只股票填写forecast_direction（up/down/flat/unknown）和forecast_horizon_sessions。
+   有明确方向时期限为1到60个交易日整数；优先固定5个交易日以便积累可比样本，不能看结果再换窗口。
+   比较提供的可靠报价与本判断上海日期之后第N个交易日收盘价，up为严格上涨、down为严格下跌、flat为不变。
+   这是假设不交易也可观察的方向判断，不以先触发进场/止盈止损为前提，不是收益承诺；目标价只是交易计划。
+   证据不足或只有条件性交易计划时使用unknown、期限null；禁止为填字段制造确定判断。参考报价与时间由系统冻结，模型不补造。
 1. 必须输出严格的JSON格式
 2. 所有价格字段必须填写，不可为null
 3. 日期格式：ISO 8601（如 2026-07-08T09:30:00+08:00）
@@ -131,6 +137,8 @@ MORNING_ANALYSIS_PROMPT = """你是一个专业的A股分析师，擅长结合�
       "sector": "所属板块",
       "action": "setup_ready/track/watch",
       "confidence": 4,
+      "forecast_direction": "up",
+      "forecast_horizon_sessions": 5,
       "horizon": "short/medium/long",
       "horizon_days": 3,
       "current_price": 100.0,
@@ -256,4 +264,5 @@ AFTERNOON_ANALYSIS_PROMPT = """你是专业A股盘中风控分析师。现在是
 5. 这是盘中研究复核，不会直接成交。输出仍沿用上午报告的严格JSON结构，至少包含 sector_recommendations、stock_recommendations、risk_warnings、news_sources。
 6. 每只股票保留 code、name、sector、horizon、horizon_days，并给出简洁但具体的 reason、incremental_basis、confidence。
 7. 只输出一个严格JSON对象，不要Markdown或额外说明。
+8. 明确独立的forecast_direction（up/down/flat/unknown）与forecast_horizon_sessions（1到60的交易日整数，优先5）。比较当前可靠报价与本判断上海日期之后第N个交易日收盘价，方向不附带先成交条件。证据不足则unknown、期限null；不要自动沿用上午预测或把confidence当概率。
 """

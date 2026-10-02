@@ -3,6 +3,7 @@
 
 import json
 import os
+from copy import deepcopy
 from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, List
@@ -146,6 +147,7 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
     sector_recommendations = []
     stock_recommendations = []
     price_validation = {}
+    forecast_input_market_data = None
     try:
         # 注入账户资金信息，让LLM根据资金量调整推荐策略
         try:
@@ -156,6 +158,9 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
         except Exception as e:
             print(f"  ⚠️ 注入账户资金信息失败: {e}")  # B1: 原为静默pass
 
+        # Forecast labels must use the quote actually provided to the model.
+        # The later execution-price refresh is a separate observation.
+        forecast_input_market_data = deepcopy(market_data)
         synthesizer = Synthesizer()
         llm_result = synthesizer.analyze(
             market_data=market_data,
@@ -254,6 +259,7 @@ def run_morning_pipeline(dry_run: bool = False, force: bool = False, date_str: s
         news_list=news_list,
         sector_recommendations=sector_recommendations,
         stock_recommendations=stock_recommendations,
+        forecast_input_market_data=forecast_input_market_data,
     )
     report["source_status"] = dict(source_status)
     report["analysis_source"] = analysis_source

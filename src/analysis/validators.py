@@ -107,6 +107,19 @@ def validate_llm_output(raw_output: str) -> Tuple[bool, Dict, str]:
         if not isinstance(confidence, (int, float)) or confidence < 1 or confidence > 5:
             return False, {}, f"个股推荐[{i}]的confidence必须在1-5之间，当前: {confidence}"
 
+        # Optional for old reports; explicit forecasts must be independently testable.
+        # Never infer direction/probability from confidence, action or price targets.
+        if "forecast_direction" in stock or "forecast_horizon_sessions" in stock:
+            direction = stock.get("forecast_direction")
+            horizon = stock.get("forecast_horizon_sessions")
+            if direction not in ("up", "down", "flat", "unknown"):
+                return False, {}, f"个股推荐[{i}]的forecast_direction无效"
+            if direction == "unknown":
+                if horizon is not None:
+                    return False, {}, f"个股推荐[{i}]的未知方向不应指定预测期限"
+            elif type(horizon) is not int or not 1 <= horizon <= 60:
+                return False, {}, f"个股推荐[{i}]的forecast_horizon_sessions必须为1到60的整数"
+
         # 校验价格字段（setup_ready必须有完整价格）
         if stock["action"] == "setup_ready":
             required_price_fields = ["current_price", "entry_price", "target_price", "stop_loss_price"]

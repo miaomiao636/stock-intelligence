@@ -1081,6 +1081,18 @@ def research_overview():
             "limitations": ["只读研究，不是收益承诺", "旧报告缺失的原始证据不会自动补造", "实验结果需样本外和前向影子验证"]}
 
 
+@app.get("/api/research/diagnostics")
+def research_diagnostics(trade_date: Optional[date] = None):
+    from src.research.diagnostics import build_diagnostics
+    return build_diagnostics(DATA_DIR, today=trade_date)
+
+
+@app.get("/api/research/scorecard")
+def research_scorecard():
+    from src.research.diagnostics import prediction_scorecard
+    return prediction_scorecard(DATA_DIR / "stock_intelligence.db")
+
+
 @app.get("/api/research/judgments")
 def research_judgments(code: Optional[str] = Query(default=None, pattern=r"^\d{6}$"),
                        limit: int = Query(default=30, ge=1, le=100)):

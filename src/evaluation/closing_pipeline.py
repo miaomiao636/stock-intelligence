@@ -64,10 +64,28 @@ def run_closing_pipeline(
         return {"status": "skip", "reason": "非交易日"}
     source_status["trading_calendar"] = "ok"
 
+    # Independent forecast review must not depend on a new recommendation being
+    # published today. Historical reruns/dry runs still cannot touch live data.
+    if dry_run:
+        prediction_review = {"status": "skipped_dry_run"}
+    elif today != date.today().isoformat():
+        prediction_review = {"status": "skipped_historical_run"}
+    else:
+        try:
+            from src.research.outcomes import run_maturity_review
+            from src.reporting.report_store import DATA_DIR
+            prediction_review = run_maturity_review(DATA_DIR)
+        except Exception:
+            prediction_review = {"status": "error", "reason": "预测到期复核失败，未改写原判断或交易记录"}
+        if prediction_review["status"] in {"error", "degraded"}:
+            warnings.append("预测到期复核存在数据缺口，未将未知结果判为成功或失败")
+    source_status["prediction_review"] = prediction_review["status"]
+
     # 2. 检查当天morning.json
     morning_report = load_report(today, "morning")
     if not morning_report:
-        return {"status": "error", "reason": "未找到当天盘前推荐，请先运行morning"}
+        return {"status": "error", "reason": "未找到当天盘前推荐，请先运行morning",
+                "source_status": source_status, "prediction_review": prediction_review}
     source_status["morning_report"] = "ok"
 
     # 3. 获取收盘行情
@@ -226,6 +244,7 @@ def run_closing_pipeline(
             closing_report["evaluation"] = evaluation
             closing_report["market_data"] = market_data
             closing_report["account_summary"] = account_summary
+            closing_report["prediction_review"] = prediction_review
             closing_report["warnings"] = list(warnings)
             closing_report["source_status"] = dict(source_status)
             closing_report["errors"] = list(errors)
@@ -262,6 +281,7 @@ def run_closing_pipeline(
         "evaluation": evaluation,
         "market_data": market_data,
         "account_summary": account_summary,
+        "prediction_review": prediction_review,
         "report": closing_report or {},
         "source_status": source_status,
         "errors": errors,

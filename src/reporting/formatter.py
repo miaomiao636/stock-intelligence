@@ -2,6 +2,7 @@
 """报告格式化模块"""
 
 import json
+from copy import deepcopy
 from datetime import datetime
 from typing import Dict, List
 
@@ -294,6 +295,8 @@ def format_json_report(
     news_list: List[Dict],
     sector_recommendations: List[Dict],
     stock_recommendations: List[Dict],
+    *,
+    forecast_input_market_data: Dict | None = None,
 ) -> Dict:
     """格式化JSON报告"""
     
@@ -307,9 +310,19 @@ def format_json_report(
     strategy_version = "sha256:" + hashlib.sha256(strategy_file.read_bytes()).hexdigest()
     observed_at = datetime.now(timezone.utc).isoformat()
     snapshots = [{"source": "market_collector", "kind": "market_snapshot",
+                  "purpose": "report_market_context",
                   "available_at": observed_at, "fetched_at": observed_at,
                   "published_at": None, "snapshot": market_data,
                   "history_incomplete": bool(market_data.get("error")) or not bool(market_data.get("realtime_stock_prices"))}]
+    # Never label the post-analysis trade-price snapshot as the model's input.
+    # Old callers can still archive reports, but have no eligible input reference.
+    if isinstance(forecast_input_market_data, dict):
+        snapshots.append({"source": "market_collector", "kind": "market_snapshot",
+                          "purpose": "forecast_input", "available_at": observed_at,
+                          "fetched_at": observed_at, "published_at": None,
+                          "snapshot": deepcopy(forecast_input_market_data),
+                          "history_incomplete": bool(forecast_input_market_data.get("error"))
+                              or not bool(forecast_input_market_data.get("realtime_stock_prices"))})
     snapshots.extend({"source": item.get("url") or item.get("source") or "unknown",
                       "kind": "news", "published_at": item.get("published_at"),
                       "available_at": item.get("available_at"), "fetched_at": item.get("fetched_at"),
@@ -323,7 +336,7 @@ def format_json_report(
         "strategy_version": strategy_version,
         "model_version": os.getenv("LLM_MODEL", "mimo-v2.5-pro"),
         "prompt_version": "sha256:" + hashlib.sha256((AFTERNOON_ANALYSIS_PROMPT if report_type == "afternoon" else MORNING_ANALYSIS_PROMPT).encode()).hexdigest(),
-        "data_version": "evidence-snapshot-v1",
+        "data_version": "evidence-snapshot-v2-input-reference",
         "evidence_snapshots": snapshots,
         "market_regime": market_data.get("market_regime", "neutral"),
         "market_data": market_data,

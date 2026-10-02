@@ -90,9 +90,13 @@ def _merge_llm_stocks(
         code = str(original.get("code") or "")
         update = by_code.get(code)
         stock = deepcopy(original)
+        # A new observation must not silently renew the morning forecast horizon.
+        stock["forecast_direction"] = "unknown"
+        stock["forecast_horizon_sessions"] = None
         if update:
             for key in (
                 "action", "confidence", "horizon", "horizon_days", "reason",
+                "forecast_direction", "forecast_horizon_sessions",
                 "reason_news", "reason_policy", "reason_technical", "reason_fund",
                 "incremental_basis", "track_trigger", "target_price",
                 "stop_loss_price", "target_return_pct", "stop_loss_pct", "timing",
@@ -207,6 +211,7 @@ def run_afternoon_pipeline(
     custom_params["_account_cash"] = account.get("cash", 0)
     custom_params["_account_equity"] = account.get("total_equity", 0)
 
+    forecast_input_market_data = deepcopy(market_data)
     llm_result = Synthesizer().analyze_afternoon(
         market_data=market_data,
         morning_report={
@@ -239,6 +244,7 @@ def run_afternoon_pipeline(
         news_list=news_list,
         sector_recommendations=sectors,
         stock_recommendations=stocks,
+        forecast_input_market_data=forecast_input_market_data,
     )
     report.update({
         "source_status": source_status,

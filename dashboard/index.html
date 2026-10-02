@@ -325,6 +325,7 @@
 
                     <section class="dashboard-view" data-view-panel="overview" aria-labelledby="page-title-overview">
                         <div class="page-heading"><div><h1 id="page-title-overview" tabindex="-1">🏠 交易总览</h1><p>账户概况始终显示在上方；从左侧导航进入对应板块查看或调整。</p></div></div>
+                        <section id="overview-diagnostics" class="research-diagnostics" aria-label="运行与评估" aria-live="polite"><p class="research-state">加载中：核对跟踪与执行记录…</p></section>
                         <div class="overview-grid">
                             <button class="overview-link" type="button" data-view-target="recommendations"><span class="overview-icon" aria-hidden="true">📈</span><span><strong>今日推荐</strong><span id="overview-rec-summary">加载推荐数据…</span></span></button>
                             <button class="overview-link" type="button" data-view-target="positions"><span class="overview-icon" aria-hidden="true">📊</span><span><strong>当前持仓</strong><span id="overview-pos-summary">加载持仓数据…</span></span></button>
@@ -400,6 +401,7 @@
                     <section class="dashboard-view" data-view-panel="research" aria-labelledby="page-title-research" hidden>
                         <div class="page-heading"><div><h1 id="page-title-research" tabindex="-1">研究助手</h1><p>先查证据，再看分歧。资料查询 · 非实时报价 · 不下单。</p></div><button class="btn btn-sm" type="button" id="research-refresh">刷新资料</button></div>
                         <div class="research-notice">只读研究空间：回答不会修改策略、资金或持仓。多位专家的共识不代表独立验证，更不保证盈利。</div>
+                        <section id="research-diagnostics" class="research-diagnostics" aria-label="运行与评估" aria-live="polite"><p class="research-state">加载中：核对跟踪与执行记录…</p></section>
                         <div id="research-overview" class="research-overview" aria-live="polite"><p class="research-state">加载中…</p></div>
                         <div class="research-layout">
                             <div class="card research-compose">

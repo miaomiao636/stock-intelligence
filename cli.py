@@ -1133,7 +1133,7 @@ def sources():
 
 @cli.group()
 def research():
-    """只读研究与复盘归档；绝不触发交易、联网补价或自动调整策略。"""
+    """研究与复盘归档；绝不交易或调参。review-maturity可拉取历史收盘资料。"""
 
 
 def _research_store():
@@ -1154,6 +1154,22 @@ def _research_json(path):
 @research.command("status")
 def research_status():
     click.echo(json.dumps(_research_store().get_summary(), ensure_ascii=False, indent=2))
+
+
+@research.command("scorecard")
+def research_scorecard():
+    """只读方向评估、覆盖率和同样本基线；不联网、不初始化交易账本。"""
+    from src.research.diagnostics import prediction_scorecard
+    result = prediction_scorecard(PROJECT_ROOT / "data" / "stock_intelligence.db")
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@research.command("review-maturity")
+def research_review_maturity():
+    """核对到期方向：有界拉取日历/历史收盘/复权因子并追加研究复核，不调用模型或交易。"""
+    from src.research.outcomes import run_maturity_review
+    result = run_maturity_review(PROJECT_ROOT / "data")
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 @research.command("import-history")

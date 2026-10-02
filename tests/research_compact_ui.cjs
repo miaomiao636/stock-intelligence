@@ -82,6 +82,12 @@ async function fixturePage({width = 1440, scenario = 'normal'} = {}) {
         if (url.pathname === '/favicon.ico') return route.fulfill({status: 204});
         if (url.pathname.startsWith('/api/research/')) {
             if (scenario === 'error') return respond({error: 'Synthetic unavailable service'}, 503);
+            if (url.pathname === '/api/research/diagnostics') return respond({
+                as_of: oldTime, tracking: {available: false},
+                execution: {requested_date: '2026-01-01', trade_date: null,
+                    is_latest_available: false, summary: {total: 0, by_status: {}, reason_counts: {}}},
+                scorecard: null,
+            });
             if (url.pathname === '/api/research/overview') return respond({
                 available: true, judgments_count: 659, lessons_count: 83, experiments_count: 12,
                 as_of: oldTime, data_as_of: oldTime, entry_plans: {total: 0},

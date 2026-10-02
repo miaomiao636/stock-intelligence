@@ -1,6 +1,28 @@
 /* Research-only workspace: use the existing dashboard palette and controls. */
 .research-notice { padding:12px 16px; border:1px solid #dce2f4; border-left:3px solid #667eea; border-radius:8px; background:#f7f8fd; color:#465372; font-size:12px; line-height:1.8; margin-bottom:18px; }
 .research-overview { margin-bottom:18px; }
+.research-diagnostics { padding:16px; margin-bottom:18px; border:1px solid var(--border); border-radius:8px; background:#fff; min-width:0; }
+.research-diagnostics :focus-visible { outline:3px solid #a1b2f0; outline-offset:3px; }
+.research-diagnostics .btn { min-height:32px; cursor:pointer; }
+.research-diagnostic-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:14px 0 10px; }
+.research-diagnostic-cell { min-width:0; border-left:2px solid var(--border); padding-left:12px; }
+.research-diagnostic-cell h3 { margin:0 0 6px; font-size:12px; font-weight:500; color:#626d80; }
+.research-diagnostic-cell strong { display:block; font-size:14px; line-height:1.6; color:#273752; overflow-wrap:anywhere; }
+.research-diagnostic-cell strong.is-warning { color:#88631c; }
+.research-diagnostic-cell p { font-size:12px; line-height:1.7; color:#626d80; margin:5px 0 0; overflow-wrap:anywhere; }
+.research-diagnostic-boundary { font-size:12px; line-height:1.7; color:#626d80; margin:10px 0; }
+.research-diagnostic-details { padding-top:10px; border-top:1px solid var(--border); }
+.research-diagnostic-details > summary { cursor:pointer; font-size:12px; color:#34456a; line-height:1.7; }
+.research-diagnostic-detail-body { max-height:300px; overflow:auto; overscroll-behavior:contain; padding-right:4px; }
+.research-diagnostic-asof { font-size:11px; line-height:1.6; color:#6b768c; overflow-wrap:anywhere; margin:10px 0 0; }
+.research-scorecard-details { margin-top:10px; }
+.research-scorecard-table-wrap { overflow:auto; }
+.research-scorecard-table { width:100%; border-collapse:collapse; font-size:12px; color:#465372; }
+.research-scorecard-table caption { text-align:left; font-size:11px; color:#626d80; margin:8px 0; }
+.research-scorecard-table th, .research-scorecard-table td { padding:8px; border-bottom:1px solid var(--border); text-align:left; line-height:1.7; }
+.research-scorecard-table th { font-weight:600; }
+@media (max-width:768px) { .research-diagnostic-grid { gap:12px; } }
+@media (max-width:560px) { .research-diagnostic-grid { grid-template-columns:1fr; gap:12px; } .research-diagnostic-cell { padding-left:10px; } .research-diagnostic-cell h3 { margin-bottom:2px; } }
 .research-plan-summary { padding:13px 16px; border:1px solid var(--border); border-radius:8px; background:#fff; margin:10px 0; }
 .research-plan-summary summary { font-size:13px; color:#455c8b; cursor:pointer; }
 .research-stat-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
