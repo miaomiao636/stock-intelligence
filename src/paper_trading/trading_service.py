@@ -153,17 +153,8 @@ class TradingService:
         # 决策写入和订单状态更新分属两个短事务。即使进程恰好在两者之间
         # 中断，重跑时也必须继续把订单推进到 confirmed，而不能永久卡住。
         self.ledger.record_decision(order_id, "auto_execute", actor, now, event_id)
-        current = self.get_order(order_id)
-        if current and current["status"] == "confirmed":
-            return current
-        return self.ledger.update_order(
-            order_id,
-            "confirmed",
-            now,
-            decision="auto_execute",
-            decision_actor=actor,
-            decided_at=now.isoformat(),
-        )
+        # 必须在 UPDATE 中校验状态；先读后无条件写会复活并发否决的订单。
+        return self.ledger.confirm_auto_order(order_id, actor, now)
 
     def record_decision(
         self,
@@ -286,7 +277,7 @@ class TradingService:
             if not position:
                 return "没有可卖持仓"
             if position["available_quantity"] < order["quantity"]:
-                return "T+1限制：当日买入普通A股不可卖出"
+                return "T+1限制或可卖数量不足：未核实T+0资格的证券不可当日买入卖出"
             return None
 
         risk_state = self.get_risk_state(trade_date)
@@ -382,7 +373,7 @@ class TradingService:
         return None
 
     def daily_new_risk_amount(self, trade_date: str) -> float:
-        """按当日已成交买单的止损距离汇总新增风险金额。"""
+        """当日成交买单的止损风险，包含真实买入费用及预计卖出成本。"""
         risk = 0.0
         for order in self.ledger.list_orders(["filled"], trade_date):
             if order.get("action") != "buy" or not order.get("stop_price"):
@@ -398,7 +389,8 @@ class TradingService:
             exit_cost = calculate_trade_costs(
                 stop * quantity, "sell", order.get("instrument_type") or "stock"
             )["total_cost"]
-            risk += (price - stop) * quantity + exit_cost
+            # 成交 price 已含买入滑点，只补实际买入 fees，不能重复估算滑点。
+            risk += (price - stop) * quantity + float(trade["fees"]) + exit_cost
         return round(risk, 4)
 
     def _reentry_cooldown_error(self, code: str, trade_date: str, config: Dict) -> Optional[str]:
@@ -442,7 +434,7 @@ class TradingService:
                 lots = conn.execute(
                     "SELECT l.*, t.fees AS buy_fees, t.amount AS buy_amount, t.quantity AS buy_quantity "
                     "FROM position_lots l JOIN trading_trades t ON t.trade_id=l.buy_trade_id "
-                    "WHERE l.code=? AND l.quantity>0 AND (l.instrument_type!='stock' OR l.acquired_date<?) "
+                    "WHERE l.code=? AND l.quantity>0 AND is_lot_sellable(l.code,l.acquired_date,?) "
                     "ORDER BY t.executed_at,t.rowid",
                     (order["code"], now.date().isoformat()),
                 ).fetchall()

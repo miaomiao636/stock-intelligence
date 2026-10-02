@@ -15,6 +15,7 @@ from src.paper_trading.entry_plans import EntryPlanStore, PENDING, TERMINAL
 from src.notifier.feishu import FeishuNotifier
 from src.paper_trading.quality_gate import (
     build_execution_levels,
+    calculate_net_reward_risk,
     entry_trigger_error,
     resolve_stop_rate,
 )
@@ -33,6 +34,11 @@ from src.utils.cost_calculator import calculate_trade_costs
 DEFENSIVE_SECTORS = {
     "公用事业", "银行", "食品饮料", "医药", "消费", "交通运输", "电力", "煤炭", "金融",
 }
+
+# One original order plus two successor attempts per holding/day. Do not retry
+# business rejections, uncertain ledger failures, vetoes or price-band failures.
+EXIT_ATTEMPT_LIMIT = 3
+RETRYABLE_EXIT_QUOTE_ERRORS = frozenset({"行情已过期", "09:40行情获取失败"})
 
 
 def _is_etf(stock: Dict) -> bool:
@@ -472,8 +478,15 @@ class PaperTradingWorkflow:
         quantity = int(max_amount // (price * 100)) * 100
         while quantity >= 100:
             buy_cost = calculate_trade_costs(price * quantity, "buy", instrument_type)["total_cost"]
-            exit_cost = calculate_trade_costs(stop * quantity, "sell", instrument_type)["total_cost"]
-            risk_amount = (price - stop) * quantity + exit_cost
+            risk_amount = calculate_net_reward_risk(
+                entry_market_price=price,
+                # net_risk is independent of the target leg. The actual research
+                # target is checked separately by build_execution_levels below.
+                target_market_price=price + (price - stop),
+                stop_market_price=stop,
+                quantity=quantity,
+                instrument_type=instrument_type,
+            )["net_risk"]
             if (
                 price * quantity + buy_cost <= cash - equity * reserve_pct + 1e-9
                 and risk_amount <= risk_budget + 1e-9
@@ -481,6 +494,58 @@ class PaperTradingWorkflow:
                 return quantity
             quantity -= 100
         return 0
+
+    def _intraday_exit_attempt(self, position, price, reason):
+        """Keep a stable exit intent; rejected attempts remain immutable history.
+
+        Each scan can create at most one successor. Deterministic attempt keys
+        survive restart and concurrent scans; the service still revalidates the
+        quote, availability and transaction claim before any simulated fill.
+        """
+        now = self.service.now()
+        trade_date = now.date().isoformat()
+        if self.service.ledger.is_day_paused(trade_date):
+            return None, "今日模拟交易已由用户暂停，不自动重试"
+        prefix = f"exit:{trade_date}:{position['code']}:"
+        previous = [order for order in self.service.ledger.list_orders(trade_date=trade_date)
+                    if order["action"] == "sell" and order["recommendation_id"] == position["recommendation_id"]
+                    and order["idempotency_key"].startswith(prefix)]
+        # Also respect legacy reason-based keys. A changed trigger text cannot
+        # turn the same holding's veto/terminal rejection into a new exit intent.
+        for order in previous:
+            if order.get("decision") in {"veto", "pause_day"} or order["status"] in {"cancelled_by_user", "paused_for_day"}:
+                return None, f"退出订单已由用户终结（{order['status']}），不自动重试"
+            if order["status"] == "rejected" and order.get("reject_reason") not in RETRYABLE_EXIT_QUOTE_ERRORS:
+                return None, f"已有退出订单不可自动重试：{order.get('reject_reason') or '未知拒绝原因'}"
+        root = next((order for order in previous if ":retry:" not in order["idempotency_key"]), None)
+        base_key = root["idempotency_key"] if root else prefix + position["recommendation_id"]
+        for attempt in range(EXIT_ATTEMPT_LIMIT):
+            key = base_key if attempt == 0 else f"{base_key}:retry:{attempt}"
+            existing = self.service.ledger.get_order_by_idempotency(key)
+            if existing:
+                if existing["status"] == "rejected" and existing.get("reject_reason") in RETRYABLE_EXIT_QUOTE_ERRORS:
+                    if attempt == EXIT_ATTEMPT_LIMIT - 1:
+                        return None, "临时行情失败已达到当日退出重试上限，需人工核查，持仓未卖出"
+                    continue
+                if existing["status"] in {"proposed", "confirmed"}:
+                    return existing, None
+                return None, f"退出订单状态 {existing['status']}，不自动重试：{existing.get('reject_reason') or '等待核查'}"
+            quantity = int(position["available_quantity"])
+            if root:
+                quantity = min(quantity, int(root["quantity"]))
+            if quantity <= 0:
+                return None, "当前没有可卖数量，不自动重试"
+            return self.service.propose_order(
+                run_id=root["run_id"] if root else f"{trade_date}-intraday",
+                recommendation_id=position["recommendation_id"],
+                code=position["code"], name=position["name"], sector=position.get("sector") or "",
+                action="sell", quantity=quantity, planned_price=price,
+                min_price=round(price * 0.99, 3), max_price=round(price * 1.01, 3),
+                instrument_type=position.get("instrument_type", "stock"),
+                horizon=position.get("horizon", "short"), reason=root["reason"] if root else reason,
+                idempotency_key=key,
+            ), None
+        return None, "退出重试上限已达到，需人工核查"
 
     def execute_due_orders(self) -> Dict:
         """恢复扫描：执行已自动确认或遗留确认窗口到期的订单。"""
@@ -571,24 +636,13 @@ class PaperTradingWorkflow:
                 if position["available_quantity"] <= 0:
                     alerts.append(f"{position['name']} {reason}，但受T+1限制，下一可卖时点处理")
                 else:
-                    order = self.service.propose_order(
-                        run_id=f"{self.service.now().date().isoformat()}-intraday",
-                        recommendation_id=position["recommendation_id"],
-                        code=position["code"],
-                        name=position["name"],
-                        sector=position.get("sector") or "",
-                        action="sell",
-                        quantity=int(position["available_quantity"]),
-                        planned_price=price,
-                        min_price=round(price * 0.99, 3),
-                        max_price=round(price * 1.01, 3),
-                        instrument_type=position.get("instrument_type", "stock"),
-                        horizon=position.get("horizon", "short"),
-                        reason=reason,
-                        idempotency_key=f"exit:{self.service.now().date().isoformat()}:{position['code']}:{reason}",
-                    )
+                    order, blocked = self._intraday_exit_attempt(position, price, reason)
+                    if blocked:
+                        alerts.append(f"{position['name']} {reason}，{blocked}")
+                        continue
                     if order["status"] == "proposed":
                         order = self.service.confirm_automatically(order["order_id"])
+                    if order["status"] == "confirmed":
                         result = self.service.execute_ready_order(order["order_id"], quotes[position["code"]])
                         final = result.get("order") or self.service.get_order(order["order_id"])
                         if result.get("success") and result.get("trade"):

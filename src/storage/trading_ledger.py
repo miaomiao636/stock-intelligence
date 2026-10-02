@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
+from src.utils.instrument_settlement import is_lot_sellable
+
 
 class TradingLedger:
     """账户、订单、成交、批次持仓和权益快照的事务账本。"""
@@ -24,6 +26,8 @@ class TradingLedger:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=15)
         conn.row_factory = sqlite3.Row
+        # Python 规则供聚合显示和原子撮合 SQL 共用；不新增表、字段或持久化函数。
+        conn.create_function("is_lot_sellable", 3, is_lot_sellable, deterministic=True)
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=15000")
@@ -314,6 +318,19 @@ class TradingLedger:
             )
             return cursor.rowcount == 1
 
+    def confirm_auto_order(self, order_id: str, actor: str, now: datetime) -> Dict:
+        """只推进尚未确认的新单，不能覆盖并发执行、人工决定或终结状态。"""
+        with self.transaction() as conn:
+            if not self.get_order(order_id, conn):
+                raise ValueError("订单不存在")
+            conn.execute(
+                "UPDATE trading_orders SET status='confirmed',decision='auto_execute',"
+                "decision_actor=?,decided_at=?,updated_at=? WHERE order_id=? "
+                "AND status IN ('proposed','pre_notified')",
+                (actor, now.isoformat(), now.isoformat(), order_id),
+            )
+        return self.get_order(order_id)
+
     def pause_day(self, trade_date: str, now: datetime, actor: str) -> None:
         with self.transaction() as conn:
             conn.execute(
@@ -364,7 +381,7 @@ class TradingLedger:
                        MAX(horizon) horizon,SUM(quantity) quantity,
                        SUM(quantity*avg_cost)/SUM(quantity) avg_cost,MAX(current_price) current_price,
                        SUM(quantity*current_price) market_value,
-                       SUM(CASE WHEN instrument_type='stock' AND acquired_date>=? THEN 0 ELSE quantity END) available_quantity,
+                       SUM(CASE WHEN is_lot_sellable(code,acquired_date,?) THEN quantity ELSE 0 END) available_quantity,
                        MAX(recommendation_id) recommendation_id,MIN(acquired_date) entry_date,MAX(highest_price) highest_price
                 FROM position_lots WHERE quantity>0 GROUP BY code ORDER BY code
                 """,
