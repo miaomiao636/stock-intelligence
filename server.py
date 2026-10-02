@@ -177,21 +177,38 @@ async def get_positions(date_str: Optional[str] = None):
 
 
 # API: 获取今日推荐（自动补全实时价格，自动回退到最近可用日期）
+def _recommendation_dates(target: date) -> List[date]:
+    """Discover stored report days; a long holiday is not a missing-data error.
+
+    Do not infer that a stored report day was a trading day. The UI presents the
+    actual report date, and future/sidecar directories are never candidates.
+    """
+    from src.reporting import report_store
+    days = {target - timedelta(days=offset) for offset in range(4)}
+    directory = report_store.DATA_DIR / "recommendations"
+    if directory.is_dir():
+        for child in directory.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                day = date.fromisoformat(child.name)
+            except ValueError:
+                continue
+            if day.isoformat() == child.name and day <= target:
+                days.add(day)
+    return sorted(days, reverse=True)
+
+
 @app.get("/api/recommendation")
 async def get_recommendation(date_str: Optional[str] = None):
     from src.reporting.report_store import load_report
-    from datetime import timedelta
 
     target = date_str or date.today().isoformat()
-    report = load_report(target, "morning")
-
-    # If no report for target date, try previous days (up to 3 days back)
-    if not report:
-        for offset in range(1, 4):
-            fallback = (date.fromisoformat(target) - timedelta(days=offset)).isoformat()
-            report = load_report(fallback, "morning")
-            if report:
-                break
+    report = None
+    for day in _recommendation_dates(date.fromisoformat(target)):
+        report = load_report(day.isoformat(), "morning")
+        if report:
+            break
 
     if not report:
         return ApiResponse.fail("No recommendation found")
@@ -221,21 +238,20 @@ def regenerate_morning_analysis():
 # API: 获取所有时段推荐（自动查找最近可用数据）
 @app.get("/api/recommendations/all")
 async def get_all_recommendations():
-    from src.reporting.report_store import load_report
-    from datetime import timedelta
+    from src.reporting.report_store import load_report, get_report_checksum
 
     today = date.today()
     result = []
 
-    # Try up to 3 days back for each type
-    for day_offset in range(0, 4):
-        target = (today - timedelta(days=day_offset))
+    for target in _recommendation_dates(today):
 
         # 收盘分析
         closing = load_report(target.isoformat(), "closing")
         if closing:
+            revision = get_report_checksum(closing)
             _enrich_stock_prices(closing)
             result.append({
+                "revision": revision,
                 "label": f"{target.isoformat()} 收盘分析 (16:45)",
                 "period": f"{target.isoformat()}_closing",
                 "time": "16:45",
@@ -247,8 +263,10 @@ async def get_all_recommendations():
         # 13:15盘中复核
         afternoon = load_report(target.isoformat(), "afternoon")
         if afternoon:
+            revision = get_report_checksum(afternoon)
             _enrich_stock_prices(afternoon)
             result.append({
+                "revision": revision,
                 "label": f"{target.isoformat()} 下午复核 (13:15)",
                 "period": f"{target.isoformat()}_afternoon",
                 "time": "13:15",
@@ -260,8 +278,10 @@ async def get_all_recommendations():
         # Try morning
         morning = load_report(target.isoformat(), "morning")
         if morning:
+            revision = get_report_checksum(morning)
             _enrich_stock_prices(morning)
             result.append({
+                "revision": revision,
                 "label": f"{target.isoformat()} 盘前推荐 (08:45)",
                 "period": f"{target.isoformat()}_morning",
                 "time": "08:45",

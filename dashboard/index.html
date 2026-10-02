@@ -28,6 +28,7 @@
         .nav-icon { width: 22px; flex: 0 0 22px; text-align: center; }
         .nav-badge { margin-left: auto; min-width: 20px; padding: 1px 6px; border-radius: 10px; color: #fff; background: #e74c3c; font-size: 10px; font-weight: 700; text-align: center; }
         .nav-badge[hidden] { display: none; }
+        .data-quality-warning { padding: 12px; margin-bottom: 16px; border: 1px solid #e6c579; border-radius: 8px; background: #fff8e1; color: #765415; line-height: 1.6; }
         .sidebar-footnote { padding: 12px 16px 16px; border-top: 1px solid rgba(255,255,255,.08); color: rgba(255,255,255,.48); font-size: 11px; line-height: 1.6; }
         .sidebar-scrim { display: none; }
         .workspace { display: flex; min-width: 0; flex: 1; flex-direction: column; overflow: hidden; }
@@ -266,7 +267,7 @@
                 <div class="nav-group">总览</div>
                 <button class="sidebar-nav-item active" type="button" data-view-target="overview" aria-current="page"><span class="nav-icon" aria-hidden="true">🏠</span><span>交易总览</span></button>
                 <div class="nav-group">分析</div>
-                <button class="sidebar-nav-item" type="button" data-view-target="recommendations"><span class="nav-icon" aria-hidden="true">📈</span><span>今日推荐</span><span class="nav-badge" id="nav-rec-count" hidden></span></button>
+                <button class="sidebar-nav-item" type="button" data-view-target="recommendations"><span class="nav-icon" aria-hidden="true">📈</span><span id="nav-rec-label">最新推荐</span><span class="nav-badge" id="nav-rec-count" hidden></span></button>
                 <button class="sidebar-nav-item" type="button" data-view-target="sectors"><span class="nav-icon" aria-hidden="true">🎯</span><span>推荐板块</span></button>
                 <button class="sidebar-nav-item" type="button" data-view-target="news"><span class="nav-icon" aria-hidden="true">📰</span><span>今日要闻</span></button>
                 <div class="nav-group">交易</div>
@@ -335,7 +336,7 @@
                     </section>
 
                     <section class="dashboard-view" data-view-panel="recommendations" aria-labelledby="page-title-recommendations" hidden>
-                        <div class="page-heading"><div><h1 id="page-title-recommendations" tabindex="-1">📈 今日推荐</h1><p>按报告时段筛选推荐，展开个股查看推荐理由和风险信息。</p></div></div>
+                        <div class="page-heading"><div><h1 id="page-title-recommendations" tabindex="-1">📈 最新推荐</h1><p id="recommendation-date-note">按报告时段查看。红色角标表示本浏览器尚未查看的报告，不是股票数量。</p></div></div>
                         <section class="card primary-card" aria-labelledby="recommendation-title">
                             <div class="card-header">
                                 <h2 id="recommendation-title">推荐列表 <span class="count" id="rec-count"></span></h2>
@@ -483,6 +484,60 @@
     };
     let showingAllRecommendations = false;
     let expandedRecommendationDetails = new Set();
+    const RECOMMENDATION_SEEN_STORAGE = 'recommendationSeenRevisionsV1';
+    let seenRecommendationRevisions = {};
+    try {
+        const stored = JSON.parse(localStorage.getItem(RECOMMENDATION_SEEN_STORAGE) || '{}');
+        seenRecommendationRevisions = Object.fromEntries(Object.entries(stored || {}).filter(([key, value]) =>
+            /^\d{4}-\d{2}-\d{2}_(morning|afternoon|closing)$/.test(key) && typeof value === 'string').slice(-200));
+    } catch (e) { /* Storage can be disabled; retain read state in memory. */ }
+
+    function recommendationRevision(report) {
+        if (report.revision) return String(report.revision);
+        // Compatibility with an older API: only stable research fields, never
+        // refreshed prices. New API supplies the original report checksum.
+        const data = report.data || {};
+        const stable = JSON.stringify([report.period, data.created_at, data.data_as_of,
+            (data.stock_recommendations || []).map(s => [s.code, s.action, s.reason, s.reasons, s.entry_price, s.target_price, s.stop_loss_price])]);
+        let hash = 2166136261;
+        for (let i = 0; i < stable.length; i++) hash = Math.imul(hash ^ stable.charCodeAt(i), 16777619);
+        return `legacy-${hash >>> 0}`;
+    }
+
+    function updateRecommendationReadState(renderedPeriods = []) {
+        const panel = document.querySelector('[data-view-panel="recommendations"]');
+        if (panel && !panel.hidden && !document.hidden) {
+            allRecommendations.filter(r => renderedPeriods.includes(r.period)).forEach(r => {
+                seenRecommendationRevisions[r.period] = recommendationRevision(r);
+            });
+            seenRecommendationRevisions = Object.fromEntries(Object.entries(seenRecommendationRevisions).sort(([a], [b]) => a.localeCompare(b)).slice(-200));
+            // Only public report IDs/revisions; never store credentials or report bodies.
+            try { localStorage.setItem(RECOMMENDATION_SEEN_STORAGE, JSON.stringify(seenRecommendationRevisions)); } catch (e) {}
+        }
+        const unread = allRecommendations.filter(r => seenRecommendationRevisions[r.period] !== recommendationRevision(r)).length;
+        const badge = document.getElementById('nav-rec-count');
+        badge.textContent = String(unread);
+        badge.title = `${unread} 份未读报告（仅本浏览器）`;
+        badge.setAttribute('aria-label', badge.title);
+        badge.hidden = unread === 0;
+    }
+
+    function updateRecommendationDate() {
+        const latest = allRecommendations.map(r => r.date || '').sort().pop();
+        const today = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit'}).format(new Date());
+        const historical = Boolean(latest && latest < today);
+        const label = latest === today ? '今日推荐' : '最近推荐';
+        DASHBOARD_VIEW_LABELS.recommendations = latest ? label : '最新推荐';
+        document.getElementById('nav-rec-label').textContent = latest ? label : '最新推荐';
+        const overviewLabel = document.querySelector('.overview-link[data-view-target="recommendations"] strong');
+        if (overviewLabel) overviewLabel.textContent = latest ? label : '最新推荐';
+        if (!document.querySelector('[data-view-panel="recommendations"]').hidden) document.title = `Stock Intelligence - ${DASHBOARD_VIEW_LABELS.recommendations}`;
+        document.getElementById('page-title-recommendations').textContent = `📈 ${latest ? `${label} · ${latest}` : '最新推荐'}`;
+        document.getElementById('recommendation-date-note').textContent = (historical
+            ? '以下为历史报告，不代表当前仍可进场；请核对有效期、最新判断和执行计划。 '
+            : '研究条件不等于成交许可，执行仍需最新行情与风控复核。 ') + '红色角标按未读报告计数，仅清除已展示的报告；切换时段或展开全部可查看其他报告。已读状态仅保存在本浏览器。';
+        return historical;
+    }
 
     // 这里只保存非敏感的当前视图名称；操作密钥、资金输入和交易凭证绝不进入浏览器存储。
     function closeDashboardSidebar() {
@@ -513,6 +568,7 @@
             try { sessionStorage.setItem(DASHBOARD_VIEW_STORAGE, viewId); } catch (e) {}
         }
         closeDashboardSidebar();
+        if (viewId === 'recommendations') renderRecommendation();
         if (focus) target?.querySelector('h1')?.focus({preventScroll:true});
         document.dispatchEvent(new CustomEvent('dashboard:viewchange', {detail:{viewId}}));
     }
@@ -829,6 +885,12 @@
     function renderRecommendation() {
         const el = document.getElementById('recommendation');
         const count = document.getElementById('rec-count');
+        if (currentTimePeriod !== 'all' && !allRecommendations.some(r => r.period === currentTimePeriod)) {
+            currentTimePeriod = 'all';
+            expandedRecommendationDetails.clear();
+            renderTimeTabs();
+        }
+        const historical = updateRecommendationDate();
 
         // Collect stocks from selected time period(s)
         let allStocks = [];
@@ -838,7 +900,7 @@
             allRecommendations.forEach(r => {
                 (r.data?.stock_recommendations||[]).forEach(s => {
                     const degraded = ['fallback', 'error', 'degraded'].includes(r.data?.source_status?.llm) || Boolean(s.degraded);
-                    allStocks.push({...s, _period: r.label, _time: r.time, _type: r.type, _date: r.date, _isFallback: degraded});
+                    allStocks.push({...s, _periodId: r.period, _period: r.label, _time: r.time, _type: r.type, _date: r.date, _isFallback: degraded});
                 });
             });
             periodLabel = `共${allStocks.length}条`;
@@ -847,7 +909,7 @@
             if (period) {
                 (period.data?.stock_recommendations||[]).forEach(s => {
                     const degraded = ['fallback', 'error', 'degraded'].includes(period.data?.source_status?.llm) || Boolean(s.degraded);
-                    allStocks.push({...s, _period: period.label, _time: period.time, _type: period.type, _date: period.date, _isFallback: degraded});
+                    allStocks.push({...s, _periodId: period.period, _period: period.label, _time: period.time, _type: period.type, _date: period.date, _isFallback: degraded});
                 });
                 periodLabel = `${allStocks.length}只`;
             }
@@ -856,22 +918,16 @@
         const uniqueStockCount = new Set(allStocks.map(s => String(s.code || '').trim()).filter(Boolean)).size;
         periodLabel = `${allStocks.length} 报告条目 · ${uniqueStockCount} 只去重股票`;
         if (count) count.textContent = `(${periodLabel})`;
-        const navCount = document.getElementById('nav-rec-count');
-        if (navCount) {
-            navCount.textContent = String(allStocks.length);
-            navCount.title = periodLabel;
-            navCount.setAttribute('aria-label', periodLabel);
-            navCount.hidden = allStocks.length === 0;
-        }
         const overviewSummary = document.getElementById('overview-rec-summary');
         if (overviewSummary) overviewSummary.textContent = allStocks.length ? `${periodLabel}；同一股票可出现在多个时段` : '当前暂无推荐数据';
 
         if (!allStocks.length) {
             el.innerHTML = '<div class="empty">暂无推荐数据<br><span style="font-size:12px;">运行 python cli.py daily --mode morning 生成推荐</span></div>';
+            updateRecommendationReadState(allRecommendations.filter(r => currentTimePeriod === 'all' || r.period === currentTimePeriod).map(r => r.period));
             return;
         }
 
-        const am = { setup_ready:'可进场', track:'跟踪观察', watch:'观望', hold:'持有', avoid:'回避', reduce:'减仓' };
+        const am = { setup_ready:historical ? '历史研究条件满足' : '研究条件满足 · 待执行复核', track:'跟踪观察', watch:'观望', hold:'持有', avoid:'回避', reduce:'减仓' };
         const ac = { setup_ready:'tag-setup', track:'tag-track', watch:'tag-watch', hold:'tag-hold', avoid:'tag-avoid', reduce:'tag-avoid' };
         const hm = { short:'短期', medium:'中期', long:'长期' };
         const hc = { short:'tag-horizon-s', medium:'tag-horizon-m', long:'tag-horizon-l' };
@@ -930,7 +986,7 @@
                     <div><span class="name">${esc(s.name||'-')}</span><span class="code">${esc(s.code)}</span></div>
                     <div class="tags">
                         ${periodTag}
-                        <span class="tag ${ac[s.action]||''}">${esc(am[s.action]||s.action)}</span>
+                        <span class="tag ${historical ? '' : (ac[s.action]||'')}">${esc(am[s.action]||s.action)}</span>
                         <span class="tag ${hc[s.horizon]||''}">${esc(hm[s.horizon]||s.horizon)} ${Number(s.horizon_days)||''}天</span>
                         <span class="tag" style="background:#f5f5f5;color:#666;">${esc(s.sector||'')}</span>
                     </div>
@@ -961,6 +1017,7 @@
             h += `<div class="recommendation-actions"><button class="btn btn-sm" type="button" onclick="toggleAllRecommendations()">${showingAllRecommendations ? '只看前三条推荐' : `查看全部推荐（${allStocks.length}条）`}</button></div>`;
         }
         el.innerHTML = h;
+        updateRecommendationReadState([...new Set(displayedStocks.map(s => s._periodId))]);
     }
 
     function toggleRecommendationDetail(event, stockKey) {
@@ -1396,24 +1453,30 @@
 
             const summary = data.summary || {};
             const tracks = data.tracks || [];
-            setPanelSummary('tracking', `胜率 ${summary.win_rate_pct||0}% · 执行覆盖 ${formatCoverage(summary.execution_coverage_pct)} · 未触发 ${summary.not_triggered||0}`);
+            const stale = ['stale', 'future_invalid', 'unknown'].includes(data.freshness?.status);
+            const incomplete = data.data_quality?.status === 'incomplete' || summary.statistics_trustworthy === false;
+            const unverified = stale || incomplete;
+            const trackingDate = data.freshness?.as_of || data.tracking_date || '未知';
+            const integrityNotice = `${stale ? '跟踪资料过期或时间待核验' : '跟踪历史不完整'} · 资料日期 ${trackingDate}。以下记录不能作为当前策略胜率或收益依据，请先检查跟踪任务及异常文件。`;
+            setPanelSummary('tracking', unverified ? integrityNotice : `胜率 ${formatCoverage(summary.win_rate_pct)} · 执行覆盖 ${formatCoverage(summary.execution_coverage_pct)} · 未触发 ${summary.not_triggered||0}`);
 
             // Grade colors
             const gradeColors = {'A':'#27ae60','B':'#2196f3','C':'#ff9800','D':'#e74c3c','F':'#b71c1c'};
             const gradeBg = {'A':'#e8f5e9','B':'#e3f2fd','C':'#fff3e0','D':'#ffeaea','F':'#ffebee'};
 
-            let h = '<div class="summary-grid">';
+            let h = unverified ? `<div class="data-quality-warning" role="alert">${esc(integrityNotice)}</div>` : '';
+            h += '<div class="summary-grid">';
             h += '<div class="summary-stat"><div class="label">总跟踪</div><div class="value">' + (summary.total_tracked||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">有效进场</div><div class="value">' + (summary.valid_samples||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">执行覆盖</div><div class="value">' + formatCoverage(summary.execution_coverage_pct) + '</div></div>';
-            h += '<div class="summary-stat"><div class="label">已结束胜率</div><div class="value" style="color:' + ((summary.win_rate_pct||0)>=50?'#27ae60':'#e74c3c') + '">' + (summary.win_rate_pct||0) + '%</div></div>';
+            h += '<div class="summary-stat"><div class="label">已结束胜率</div><div class="value">' + (unverified ? '待核验' : formatCoverage(summary.win_rate_pct)) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">进场样本闭合</div><div class="value">' + (summary.sample_coverage_pct||0) + '%</div></div>';
             h += '<div class="summary-stat"><div class="label">达标</div><div class="value" style="color:#27ae60">' + (summary.hit_target||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">止损</div><div class="value" style="color:#e74c3c">' + (summary.stopped_out||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">活跃</div><div class="value" style="color:#2196f3">' + (summary.active||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">未触发</div><div class="value">' + (summary.not_triggered||0) + '</div></div>';
             h += '<div class="summary-stat"><div class="label">证据不足</div><div class="value">' + ((summary.history_incomplete||0)+(summary.data_error||0)) + '</div></div>';
-            h += '<div class="summary-stat"><div class="label">平均收益</div><div class="value" style="color:' + ((summary.avg_return_pct||0)>=0?'#27ae60':'#e74c3c') + '">' + ((summary.avg_return_pct||0)>=0?'+':'') + (summary.avg_return_pct||0) + '%</div></div>';
+            h += '<div class="summary-stat"><div class="label">平均收益</div><div class="value">' + (unverified ? '待核验' : formatCoverage(summary.avg_return_pct)) + '</div></div>';
             h += '</div>';
 
             // Helper: render a single track card with grade + feedback
