@@ -122,6 +122,10 @@ class ResearchStore:
                     review_id TEXT PRIMARY KEY, judgment_id TEXT NOT NULL
                     REFERENCES research_judgments(judgment_id), as_of TEXT NOT NULL,
                     known_at TEXT NOT NULL, payload_json TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS research_maturity_attempts (
+                    judgment_id TEXT NOT NULL REFERENCES research_judgments(judgment_id),
+                    protocol_version TEXT NOT NULL, last_attempt_at TEXT NOT NULL,
+                    PRIMARY KEY(judgment_id,protocol_version));
                 CREATE TABLE IF NOT EXISTS research_lessons (
                     lesson_id TEXT PRIMARY KEY, known_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL);
@@ -257,6 +261,17 @@ class ResearchStore:
                   "invalidations": payload.get("invalidations") or [],
                   "provenance": payload.get("provenance") or {},
                   "history_incomplete": bool(incomplete)}
+        from src.research.maturity import build_forecast_spec, normalize_forecast_spec
+        result["forecast_spec"] = normalize_forecast_spec(payload.get("forecast_spec"), judgment=result)
+        spec = result["forecast_spec"]
+        if spec["status"] == "registered" and spec["reference_evidence_id"] not in refs:
+            result["forecast_spec"] = {**spec, "status": "excluded", "reason": "reference_evidence_not_linked"}
+        elif spec["status"] == "registered":
+            source = self._payload(conn.execute("SELECT payload_json FROM research_evidence WHERE evidence_id=?",
+                                               (spec["reference_evidence_id"],)).fetchone())
+            actual = build_forecast_spec({}, stock_code=code, snapshots=[source])
+            if any(spec.get(field) != actual.get(field) for field in ("reference_price", "reference_as_of", "reference_evidence_id", "reference_basis")):
+                result["forecast_spec"] = {**spec, "status": "excluded", "reason": "reference_evidence_mismatch"}
         conn.execute("INSERT INTO research_judgments VALUES(?,?,?,?,?)", (result["judgment_id"], code, as_of, known_at, _json(result)))
         return _view(result)
 
@@ -302,6 +317,142 @@ class ResearchStore:
             args.append(judgment_id)
         with self._connect() as conn:
             return [self._payload(row) for row in conn.execute(sql + " ORDER BY known_at DESC,rowid DESC LIMIT ?", (*args, self._limit(limit)))]
+
+    def get_prediction_scorecard(self, *, as_of=None) -> dict:
+        """Read all eligible rows, independently of paginated UI list limits."""
+        from src.research.scorecard import build_scorecard
+        cutoff = min(self._cutoff(as_of), self._now())
+        with self._connect() as conn:
+            judgments = [self._payload(row) for row in conn.execute(
+                "SELECT payload_json FROM research_judgments WHERE known_at<=? AND as_of<=? ORDER BY as_of,known_at,rowid",
+                (cutoff, cutoff))]
+            reviews = [self._payload(row) for row in conn.execute(
+                "SELECT payload_json FROM research_reviews WHERE known_at<=? AND as_of<=? "
+                "ORDER BY known_at DESC,rowid DESC", (cutoff, cutoff))]
+        return build_scorecard(judgments, reviews, as_of=cutoff)
+
+    def review_matured_predictions(self, *, as_of, calendar_provider, observation_provider) -> dict:
+        """Append idempotent direction reviews; never create orders or edit PnL.
+
+        calendar_provider(start_date, end_date) returns a complete list of ISO
+        exchange session dates in the inclusive interval, or None on failure.
+        observation_provider(code, target_date, reference_as_of) returns the raw
+        target closing quote contract in maturity.maturity_review, or None.
+        No external provider is invoked while holding a database transaction.
+        Existing verified outcomes are frozen; missing data can be retried.
+        """
+        from src.research.maturity import (PROTOCOL_VERSION, cohort_key, local_day,
+                                           maturity_target, maturity_review)
+        from src.research.outcomes import OutcomeBudgetExhausted
+        cutoff = min(self._cutoff(as_of), self._now())
+        with self._connect() as conn:
+            judgments = [self._payload(row) for row in conn.execute(
+                "SELECT payload_json FROM research_judgments WHERE known_at<=? AND as_of<=? "
+                "ORDER BY as_of,known_at,rowid", (cutoff, cutoff))]
+            reviews = [self._payload(row) for row in conn.execute(
+                "SELECT payload_json FROM research_reviews WHERE known_at<=? AND as_of<=? "
+                "ORDER BY known_at DESC,rowid DESC", (cutoff, cutoff))]
+            attempts = {row["judgment_id"]: row["last_attempt_at"] for row in conn.execute(
+                "SELECT judgment_id,last_attempt_at FROM research_maturity_attempts WHERE protocol_version=?",
+                (PROTOCOL_VERSION,))}
+        terminal = {row["judgment_id"] for row in reviews
+                    if row.get("review_kind") == PROTOCOL_VERSION
+                    and str(row.get("review_id", "")).startswith("maturity-")
+                    and row.get("prediction_status") in {"correct", "incorrect"}}
+        result = {"as_of": cutoff, "protocol_version": PROTOCOL_VERSION,
+                  "created_count": 0, "pending_count": 0, "excluded_count": 0,
+                  "duplicate_count": 0, "calendar_unavailable_count": 0,
+                  "already_reviewed_count": 0, "unavailable_count": 0, "review_ids": [],
+                  "deferred_count": 0,
+                  "affects_trading": False}
+        calendars, seen, queue = {}, set(), []
+        # Preserve first-forecast cohort selection before retry scheduling.
+        # Reordering raw judgments would allow a later revision to replace it.
+        for item in judgments:
+            key = cohort_key(item)
+            if key is None:
+                result["excluded_count"] += 1
+                continue
+            if key in seen:
+                result["duplicate_count"] += 1
+                continue
+            seen.add(key)
+            if item.get("history_incomplete"):
+                result["excluded_count"] += 1
+                continue
+            if item["judgment_id"] in terminal:
+                result["already_reviewed_count"] += 1
+                continue
+            queue.append(item)
+        # Queue metadata is deliberately separate from immutable evidence and
+        # reviews. Identical inconclusive retries have one review ID, but still
+        # advance their last-attempt time so old missing data cannot starve new
+        # forecasts. Stable sorting preserves original cohort order on ties.
+        queue.sort(key=lambda item: attempts.get(item["judgment_id"], ""))
+
+        def mark_attempt(item):
+            with self._connect() as conn:
+                conn.execute("""INSERT INTO research_maturity_attempts VALUES(?,?,?)
+                    ON CONFLICT(judgment_id,protocol_version) DO UPDATE SET
+                    last_attempt_at=MAX(last_attempt_at,excluded.last_attempt_at)""",
+                    (item["judgment_id"], PROTOCOL_VERSION, self._now()))
+
+        for index, item in enumerate(queue):
+            start, end = local_day(item["as_of"]), local_day(cutoff)
+            if (start, end) not in calendars:
+                try:
+                    calendars[start, end] = calendar_provider(start, end)
+                except OutcomeBudgetExhausted:
+                    result["deferred_count"] = len(queue) - index
+                    break
+                except Exception:
+                    # Providers may include credentials in exception text.
+                    calendars[start, end] = None
+            target, status = maturity_target(item, as_of=cutoff, sessions=calendars[start, end])
+            if status == "calendar_unavailable":
+                mark_attempt(item)
+                result["calendar_unavailable_count"] += 1
+                continue
+            if status == "pending":
+                mark_attempt(item)
+                result["pending_count"] += 1
+                continue
+            try:
+                observation = observation_provider(item["stock_code"], target,
+                                                   item["forecast_spec"]["reference_as_of"])
+            except OutcomeBudgetExhausted:
+                result["deferred_count"] = len(queue) - index
+                break
+            except Exception:
+                observation = None
+            mark_attempt(item)
+            payload = maturity_review(item, target=target, observation=observation, as_of=cutoff)
+            if payload["prediction_status"] == "inconclusive":
+                result["unavailable_count"] += 1
+            # Stable across retry times. Changed evidence is a new immutable
+            # review, never an UPDATE. Concurrent retries share the primary key.
+            identity = {key: value for key, value in payload.items() if key != "as_of"}
+            review_id = "maturity-" + hashlib.sha256(_json([item["judgment_id"], identity]).encode()).hexdigest()
+            known_at = self._now()
+            normalized = normalize_review(payload, item)
+            normalized.update(review_id=review_id, judgment_id=item["judgment_id"], known_at=known_at)
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute("SELECT 1 FROM research_reviews WHERE review_id=?", (review_id,)).fetchone()
+                if existing:
+                    continue
+                # Another worker might have completed while the provider ran.
+                outcomes = conn.execute("SELECT payload_json FROM research_reviews WHERE judgment_id=?",
+                                        (item["judgment_id"],)).fetchall()
+                if any((r := self._payload(row)).get("review_kind") == PROTOCOL_VERSION
+                       and str(r.get("review_id", "")).startswith("maturity-")
+                       and r.get("prediction_status") in {"correct", "incorrect"} for row in outcomes):
+                    continue
+                conn.execute("INSERT INTO research_reviews VALUES(?,?,?,?,?)",
+                    (review_id, item["judgment_id"], normalized["as_of"], known_at, _json(normalized)))
+            result["created_count"] += 1
+            result["review_ids"].append(review_id)
+        return result
 
     def create_lesson(self, payload: dict) -> dict:
         with self._connect() as conn:
@@ -474,9 +625,13 @@ class ResearchStore:
                 reason = rec.get("thesis") or rec.get("reason") or rec.get("recommendation_reason") or rec.get("reasons") or "原报告未保存明确研究假设"
                 if not isinstance(reason, str):
                     reason = _json(reason)
+                from src.research.maturity import build_forecast_spec
+                forecast_spec = build_forecast_spec(rec, stock_code=stock_code,
+                    snapshots=[ev for ev in verified_snapshots if ev["evidence_id"] in stock_evidence_ids])
                 item = self._record_judgment(conn, {"stock_code": stock_code,
                     "stock_name": rec.get("name"), "as_of": as_of, "horizon": rec.get("horizon") or "unknown",
                     "horizon_days": rec.get("horizon_days"),
+                    "forecast_spec": forecast_spec,
                     "thesis": reason, "supporting_evidence": stock_evidence_ids, "counter_evidence": [],
                     "context_evidence": [ev["evidence_id"] for ev in verified_snapshots if ev["evidence_id"] not in stock_evidence_ids],
                     "claim_verification_status": "not_verified", "evidence_coverage": "input_snapshot_only",
